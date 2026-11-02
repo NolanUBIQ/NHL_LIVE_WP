@@ -48,7 +48,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import brentq
-from scipy.stats import skellam
+from scipy.stats import poisson, skellam
 
 REG_SECONDS = 3600
 
@@ -449,6 +449,104 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
 
     final = P.sum(axis=(0, 1))
     return {int(k): float(v) for k, v in zip(margins, final) if v > 0}
+
+
+def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
+                       eg: EndgameParams, pulled: bool = False,
+                       pull_at: tuple[float, float] | None = None,
+                       pp_team: str | None = None, pp_seconds: float = 0.0,
+                       penalty: str = "minor",
+                       pp_mult: float = 2.3, sh_mult: float = 0.27,
+                       st_home: float = 1.0, st_away: float = 1.0,
+                       max_goals: int = 16, **_ignored) -> np.ndarray:
+    """
+    Joint distribution of the (home, away) goals still to come in regulation,
+    P[h, a], under the pull-time endgame model (for live totals).
+
+    Same endgame chain as endgame_margin_dist, but over each team's goals so
+    empty-net and extra-attacker goals land in the total. Before the endgame
+    the two teams' goals are independent Poissons, with a power play counted
+    at its expected length (a minor ends on a PP goal), so the implied margin
+    distribution differs very slightly from endgame_margin_dist's exact one.
+    """
+    G = max_goals
+    k = np.arange(G + 1)
+    T = max(t, 0.0) * REG_SECONDS
+    if T <= 0:
+        out = np.zeros((G + 1, G + 1))
+        out[0, 0] = 1.0
+        return out
+    tau1, tau2 = pull_at if pull_at is not None else (
+        assumed_pull_time(T, eg, 1), assumed_pull_time(T, eg, 2))
+    tau = max(tau1, tau2)
+    pulled = pulled and abs(d) in (1, 2)
+    pp_on = pp_team is not None and pp_seconds > 0
+    pp_end = T - pp_seconds if pp_on else -1.0
+    S0 = T if (pulled or (pp_on and pp_end < min(T, tau))) else min(T, tau)
+
+    lam_s, mu_s = lam / REG_SECONDS, mu / REG_SECONDS
+    if pp_team == "home":
+        pp_h, pp_a = lam_s * pp_mult * st_home, mu_s * sh_mult * st_away
+    else:
+        pp_h, pp_a = lam_s * sh_mult * st_home, mu_s * pp_mult * st_away
+
+    P = np.zeros((2, 2, G + 1, G + 1))   # [pulled, pp on, home goals, away goals]
+    if S0 < T:
+        L = T - S0                       # pre-endgame stretch; any PP ends inside it
+        h_mean, a_mean = lam_s * L, mu_s * L
+        if pp_on:
+            s = min(pp_seconds, L)
+            a_rate = pp_h if pp_team == "home" else pp_a          # PP team's rate
+            s_eff = (s if penalty == "major" or a_rate <= 0
+                     else (1 - np.exp(-a_rate * s)) / a_rate)
+            h_mean = pp_h * s_eff + lam_s * (L - s_eff)
+            a_mean = pp_a * s_eff + mu_s * (L - s_eff)
+        P0 = np.outer(poisson.pmf(k, h_mean), poisson.pmf(k, a_mean))
+        P[0, 0] = P0 / P0.sum()
+    else:
+        P[int(pulled), int(pp_on), 0, 0] = 1.0
+    if S0 <= 0:
+        return P.sum(axis=(0, 1))
+
+    W = eg.window_seconds
+    M = d + k[:, None] - k[None, :]      # margin in each cell
+    rh = np.full((2, 2, G + 1, G + 1), lam_s)
+    ra = np.full((2, 2, G + 1, G + 1), mu_s)
+    for margin, (eh, ea) in {1: (eg.e_lam_L, eg.e_mu_L), -1: (eg.e_lam_T, eg.e_mu_T),
+                             2: (eg.e2_lead, eg.e2_trail),
+                             -2: (eg.e2_trail, eg.e2_lead)}.items():
+        mask = M == margin
+        rh[1, 0][mask], ra[1, 0][mask] = eh / W, ea / W
+    if pp_on:
+        rh[:, 1], ra[:, 1] = pp_h, pp_a
+    home_ends_pp = pp_on and pp_team == "home" and penalty == "minor"
+    away_ends_pp = pp_on and pp_team == "away" and penalty == "minor"
+    one, two = np.abs(M) == 1, np.abs(M) == 2
+
+    n = max(int(np.ceil(S0 - 1e-9)), 1)
+    h = S0 / n
+    tot = rh + ra
+    pg = 1.0 - np.exp(-tot * h)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ph = np.where(tot > 0, pg * rh / tot, 0.0)
+        pa = np.where(tot > 0, pg * ra / tot, 0.0)
+    for j in range(n):
+        s = S0 - j * h
+        if pp_on and s <= pp_end + 1e-9:
+            P[:, 0] += P[:, 1]
+            P[:, 1] = 0.0
+        for mask, tau_m in ((one, tau1), (two, tau2)):
+            if s <= tau_m + 1e-9:
+                P[1][:, mask] += P[0][:, mask]
+                P[0][:, mask] = 0.0
+        home_g, away_g = P * ph, P * pa
+        P = P - home_g - away_g
+        for pp in (0, 1):
+            to_h = 0 if (pp == 1 and home_ends_pp) else pp
+            to_a = 0 if (pp == 1 and away_ends_pp) else pp
+            P[0, to_h, 1:, :] += home_g[:, pp, :-1, :].sum(axis=0)
+            P[0, to_a, :, 1:] += away_g[:, pp, :, :-1].sum(axis=0)
+    return P.sum(axis=(0, 1))
 
 
 def _outcomes_from_margins(margins: dict[int, float], p_ot: float) -> InGameProbs:

@@ -7,21 +7,26 @@ Prices produced for every state:
   - alt puck lines incl. OT/SO
   - live totals (final score incl. the OT/SO winner's goal), see below
 
-Pregame inputs are a home win prob (incl. OT) and an expected total, from the
-market or from the pregame model's predictions file; lam / mu are backed out
-with nhl_ingame_skellam.fit_lambdas. PP / SH scoring uses the pregame model's
-special-teams ratings for the two teams (pregame_st.py), same as the sim UI.
+Pregame inputs are a home win prob (incl. OT) and an expected total (incl. the
+OT/SO goal), from the market or from the pregame model's predictions file;
+lam / mu are solved so the model's own puck-drop prices, pulled-goalie goals
+and OT goal included, reproduce them (fit_to_market). PP / SH scoring uses the
+pregame model's special-teams ratings for the two teams (pregame_st.py), same
+as the sim UI.
 
 Game situations:
-  - regulation: nhl_ingame_skellam.regulation_margin_dist with the live score,
-    clock, PP window (minor / major) and pulled-goalie endgame model
+  - regulation: nhl_ingame_skellam.endgame_margin_dist with the live score,
+    clock, PP window (minor / major) and pull-time endgame model: a team
+    down 1 or 2 is assumed to pull at 2:00 / 2:45 left (rolled back 30 s
+    each time that passes), and the feed's goalie-out flag switches to the
+    pulled state as soon as it happens
   - 5-on-3: the PP multiplier is the time-weighted mix of pp53_mult (two-man
     portion) and pp_mult over the whole advantage
   - OT / shootout: the game is tied, so home wins with p_ot
-Totals use a joint grid of independent Poissons for each team's remaining
-goals (PP window at its expected length, endgame goals and the OT goal moved
-on the grid). That approximation is separate from the exact diff model used
-for the moneyline and puck lines, so the two can differ very slightly.
+Totals use nhl_ingame_skellam.endgame_goals_dist (the same endgame chain over
+each team's goals; before the endgame, independent Poissons with the PP at its
+expected length), so they can differ very slightly from the exact margin
+model used for the moneyline and puck lines.
 """
 
 from __future__ import annotations
@@ -43,6 +48,10 @@ from live_feed import REG_SECONDS, GameState
 PREDICTIONS_CSV = pregame_st.PREGAME_DIR / "data" / "predictions_today_tomorrow.csv"
 DEFAULT_SPREADS = (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5)
 TOTAL_GRID = 16
+# a goalie-out flag only counts as an endgame pull in the last this-many
+# seconds of regulation (earlier ones are delayed-penalty pulls)
+PULL_MAX_SECONDS = 360
+NO_PULLS = m.EndgameParams(pull_seconds=0, pull2_seconds=0)   # endgame off
 
 
 def parse_price(s: str) -> float:
@@ -101,7 +110,7 @@ def build_config(home: str, away: str, home_prob: float, total: float,
     Returns (config, note). With use_st the PP/SH rates are built off
     league_gf x mults x the teams' pregame special-teams factors.
     """
-    lam, mu = m.fit_lambdas(home_prob, total, p_ot)
+    lam, mu = fit_to_market(home_prob, total, p_ot, kw.get("endgame", m.EndgameParams()))
     note = f"λ={lam:.3f} μ={mu:.3f}"
     cfg = PricerConfig(lam, mu, p_ot, **kw)
     if use_st:
@@ -113,6 +122,30 @@ def build_config(home: str, away: str, home_prob: float, total: float,
         except Exception as e:          # unknown team, missing files
             note += f" | ST ratings off: {e}"
     return cfg, note
+
+
+def fit_to_market(home_prob: float, total: float, p_ot: float | None,
+                  endgame: m.EndgameParams | None, iters: int = 8) -> tuple[float, float]:
+    """
+    (lam, mu) such that the live model's puck-drop win prob incl. OT and
+    expected final total (incl. pulled-goalie goals and the OT/SO goal)
+    match the market. lam + mu ends up below the market total.
+    """
+    eg = endgame or NO_PULLS
+    k = np.arange(TOTAL_GRID + 1)
+    tot_grid = k[:, None] + k[None, :] + (k[:, None] == k[None, :])   # +1 OT goal on ties
+    base_total, prob = total, home_prob
+    for _ in range(iters):
+        lam, mu = m.fit_lambdas(prob, base_total, p_ot)
+        po = p_ot if p_ot is not None else lam / (lam + mu)
+        reg = m.endgame_margin_dist(lam, mu, 1.0, 0, eg)
+        wp = sum(v for d, v in reg.items() if d > 0) + reg.get(0, 0.0) * po
+        exp_total = float((m.endgame_goals_dist(lam, mu, 1.0, 0, eg) * tot_grid).sum())
+        if abs(wp - home_prob) < 1e-4 and abs(exp_total - total) < 1e-3:
+            break
+        base_total *= total / exp_total
+        prob = min(max(prob + home_prob - wp, 0.03), 0.97)
+    return lam, mu
 
 
 def pregame_line(home: str, away: str, day: date | None = None) -> tuple[float, float, str]:
@@ -196,7 +229,16 @@ class LivePricer:
         mult = (two * c.pp53_mult + (s - two) * c.pp_mult) / s
         return st.pp_team, s, st.pp_kind, mult
 
-    def _regulation(self, st: GameState) -> dict[int, float]:
+    def pulled(self, st: GameState) -> bool:
+        """The trailing team (down 1 or 2) has its goalie out late in regulation."""
+        if self.cfg.endgame is None or abs(st.d) not in (1, 2):
+            return False
+        if REG_SECONDS - st.elapsed > PULL_MAX_SECONDS or st.period != 3:
+            return False
+        return st.home_goalie_pulled if st.d < 0 else st.away_goalie_pulled
+
+    def _model_args(self, st: GameState):
+        """(t, endgame params, pulled, PP kwargs) for the library calls."""
         c = self.cfg
         T = max(REG_SECONDS - st.elapsed, 0)
         kw = {}
@@ -205,66 +247,26 @@ class LivePricer:
             team, s, kind, mult = pp
             kw = dict(pp_team=team, pp_seconds=s, penalty=kind, pp_mult=mult,
                       sh_mult=c.sh_mult, dt=c.dt, st_home=c.st_home, st_away=c.st_away)
-        return m.regulation_margin_dist(c.lam, c.mu, T / REG_SECONDS, st.d,
-                                        endgame=c.endgame, **kw)
+        return T / REG_SECONDS, c.endgame or NO_PULLS, self.pulled(st), kw
+
+    def _regulation(self, st: GameState) -> dict[int, float]:
+        c = self.cfg
+        t, eg, pulled, kw = self._model_args(st)
+        return m.endgame_margin_dist(c.lam, c.mu, t, st.d, eg, pulled=pulled, **kw)
 
     def _total_dist(self, st: GameState) -> dict[int, float]:
         """Final total goals (incl. the OT/SO goal) -> prob."""
         c = self.cfg
         cur = st.home_score + st.away_score
-        T = max(REG_SECONDS - st.elapsed, 0)
-        lam_s, mu_s = c.lam / REG_SECONDS, c.mu / REG_SECONDS
-        h_mean, a_mean = lam_s * T, mu_s * T
-        pp = self._pp(st, T)
-        if pp:
-            team, s, kind, mult = pp
-            if team == "home":
-                a_rate, b_rate = lam_s * mult * c.st_home, mu_s * c.sh_mult * c.st_away
-            else:
-                a_rate, b_rate = mu_s * mult * c.st_away, lam_s * c.sh_mult * c.st_home
-            # a minor ends on a PP goal: use its expected length
-            s_eff = s if kind == "major" or a_rate <= 0 else (1 - math.exp(-a_rate * s)) / a_rate
-            pp_mean, sh_mean = a_rate * s_eff, b_rate * s_eff
-            if team == "home":
-                h_mean = pp_mean + lam_s * (T - s_eff)
-                a_mean = sh_mean + mu_s * (T - s_eff)
-            else:
-                a_mean = pp_mean + mu_s * (T - s_eff)
-                h_mean = sh_mean + lam_s * (T - s_eff)
-
-        k = np.arange(TOTAL_GRID + 1)
-        joint = np.outer(poisson.pmf(k, h_mean), poisson.pmf(k, a_mean))
-        joint /= joint.sum()
-
-        eg = c.endgame
-        scale = min(T, eg.window_seconds) / eg.window_seconds if eg and T > 0 else 0.0
-        tie_l = en_l = tie_t = en_t = 0.0
-        if scale > 0:
-            tie_l, en_l = m._endgame_split(eg.e_lam_L, eg.e_mu_L, scale)
-            tie_t, en_t = m._endgame_split(eg.e_mu_T, eg.e_lam_T, scale)
-
+        t, eg, pulled, kw = self._model_args(st)
+        joint = m.endgame_goals_dist(c.lam, c.mu, t, st.d, eg, pulled=pulled,
+                                     max_goals=TOTAL_GRID, **kw)
         out: dict[int, float] = {}
-
-        def add(margin, total, p):
-            if margin == 0:            # OT/SO winner's goal counts in the final score
+        for h, a in zip(*np.nonzero(joint > 1e-12)):
+            total = cur + h + a
+            if st.d + h - a == 0:      # OT/SO winner's goal counts in the final score
                 total += 1
-            out[total] = out.get(total, 0.0) + p
-
-        for h in k:
-            for a in k:
-                p = joint[h, a]
-                if p < 1e-12:
-                    continue
-                margin, total = st.d + h - a, cur + h + a
-                if margin == 1 and scale > 0:
-                    add(0, total + 1, p * tie_l)
-                    add(2, total + 1, p * en_l)
-                    p *= 1 - tie_l - en_l
-                elif margin == -1 and scale > 0:
-                    add(0, total + 1, p * tie_t)
-                    add(-2, total + 1, p * en_t)
-                    p *= 1 - tie_t - en_t
-                add(margin, total, p)
+            out[int(total)] = out.get(int(total), 0.0) + float(joint[h, a])
         return out
 
     # -- public -----------------------------------------------------------------

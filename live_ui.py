@@ -53,11 +53,13 @@ PARAMS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("e_lam_L", "Home leads: home xG", "0.30"),
-        ("e_mu_L", "Home leads: away xG", "0.18"),
-        ("e_lam_T", "Home trails: home xG", "0.18"),
-        ("e_mu_T", "Home trails: away xG", "0.30"),
-        ("window", "Window (s)", "150"),
+        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "0.92"),
+        ("eg_trail1", "Down 1: trailer xG / 2:30", "0.31"),
+        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.99"),
+        ("eg_trail2", "Down 2: trailer xG / 2:30", "0.30"),
+        ("pull_at", "Assumed pull, down 1 (s left)", "120"),
+        ("pull2_at", "Assumed pull, down 2 (s left)", "165"),
+        ("roll", "Then every (s)", "30"),
     ]),
 ]
 
@@ -422,9 +424,12 @@ class LiveApp(tk.Tk):
         self.entries["p_ot"].state(["disabled"] if self.p_ot_auto.get() else ["!disabled"])
         eg = None
         if self.endgame_on.get():
-            eg = m.EndgameParams(self._num("e_lam_L"), self._num("e_mu_L"),
-                                 self._num("e_lam_T"), self._num("e_mu_T"),
-                                 self._num("window", positive=True))
+            lead1, trail1 = self._num("eg_lead1"), self._num("eg_trail1")
+            eg = m.EndgameParams(lead1, trail1, trail1, lead1,
+                                 pull_seconds=self._num("pull_at"),
+                                 roll_seconds=self._num("roll", positive=True),
+                                 e2_lead=self._num("eg_lead2"), e2_trail=self._num("eg_trail2"),
+                                 pull2_seconds=self._num("pull2_at"))
         try:
             ladder = tuple(float(x) for x in self.ladder_var.get().replace(";", ",").split(",")
                            if x.strip())
