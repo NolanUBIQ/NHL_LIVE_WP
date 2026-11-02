@@ -9,8 +9,13 @@ The simulated game uses the same assumptions as the model:
   - goals arrive as Poisson processes at lam/3600 and mu/3600 per second
   - penalties arrive at a set rate per team; during a PP the PP team scores at
     base * pp_mult and the SH team at base * sh_mult; a PP goal ends a minor
-  - with the endgame on, in the last `window` seconds of the 3rd with a
-    one-goal margin, scoring switches to the endgame xG spread over the window
+  - with the endgame on, a team down one or two pulls its goalie at its own
+    random pull time (or by hand); while pulled, scoring switches to the
+    endgame rates (fitted from NHL play-by-play, see analysis/empty_net.py)
+    until a goal changes the margin. The model doesn't know the pull time:
+    down 1 it assumes 2:00 left, then 1:30, 1:00, ... as each passes without
+    a pull (down 2: 2:45, 2:15, ...), and prices a pulled goalie as soon as
+    it happens
   - a regulation tie goes to OT/SO, which home wins with probability p_ot
   - optionally, PP/SH scoring rates come from the pregame model's special-teams
     ratings for the chosen teams (see pregame_st.py)
@@ -76,6 +81,10 @@ class Params:
     endgame: m.EndgameParams | None
     st_home: float = 1.0     # PP/SH scoring-rate multipliers (pregame ST ratings)
     st_away: float = 1.0
+    sim_pull_mean: float = 120.0   # simulated pull time down 1, seconds left
+    sim_pull_sd: float = 40.0
+    sim_pull2_mean: float = 170.0  # simulated pull time down 2
+    sim_pull2_sd: float = 70.0
 
 
 # (key, label, default) grouped by section
@@ -98,11 +107,17 @@ SECTIONS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("e_lam_L", "Home leads: home xG", "0.30"),
-        ("e_mu_L", "Home leads: away xG", "0.18"),
-        ("e_lam_T", "Home trails: home xG", "0.18"),
-        ("e_mu_T", "Home trails: away xG", "0.30"),
-        ("window", "Window (s)", "150"),
+        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "0.92"),
+        ("eg_trail1", "Down 1: trailer xG / 2:30", "0.31"),
+        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.99"),
+        ("eg_trail2", "Down 2: trailer xG / 2:30", "0.30"),
+        ("pull_at", "Model: pull down 1 at (s left)", "120"),
+        ("pull2_at", "Model: pull down 2 at (s left)", "165"),
+        ("roll", "Model: then every (s)", "30"),
+        ("sim_pull_mean", "Sim down 1: pull mean / sd", "120"),
+        ("sim_pull_sd", None, "40"),
+        ("sim_pull2_mean", "Sim down 2: pull mean / sd", "170"),
+        ("sim_pull2_sd", None, "70"),
     ]),
 ]
 
@@ -149,14 +164,17 @@ def short_clock(elapsed: int) -> str:
 
 # ── Model evaluation ─────────────────────────────────────────────────────────
 
-def regulation_dist(p: Params, elapsed: int, d: int, pp_team, pp_left, pp_kind):
+def regulation_dist(p: Params, elapsed: int, d: int, pp_team, pp_left, pp_kind,
+                    pulled: bool = False):
     t = max(REG - elapsed, 0) / REG
     kw = {}
     if pp_team and pp_left > 0:
         kw = dict(pp_team=pp_team, pp_seconds=pp_left, penalty=pp_kind,
                   pp_mult=p.pp_mult, sh_mult=p.sh_mult, dt=p.dt,
                   st_home=p.st_home, st_away=p.st_away)
-    return m.regulation_margin_dist(p.lam, p.mu, t, d, endgame=p.endgame, **kw)
+    if p.endgame is not None:
+        return m.endgame_margin_dist(p.lam, p.mu, t, d, p.endgame, pulled=pulled, **kw)
+    return m.regulation_margin_dist(p.lam, p.mu, t, d, **kw)
 
 
 def outcomes(reg: dict[int, float], p_ot: float) -> m.InGameProbs:
@@ -191,13 +209,54 @@ class GameSim:
         self.final: str | None = None      # "home" / "away" once decided
         self.ot = False
         self.log: list[str] = []
+        # goalie pulls: each team's pull time is mean + sd * z (own stream, so
+        # a seed's goals/penalties don't depend on the pull settings)
+        z = np.random.default_rng(None if seed is None else [seed, 7]).standard_normal(4)
+        self.pull_z = {("home", 1): z[0], ("away", 1): z[1],
+                       ("home", 2): z[2], ("away", 2): z[3]}
+        self.pulled: str | None = None     # team whose goalie is out
+        self.pull_spans: list[tuple[int, int, str]] = []
+        self._pull_open = 0
 
     @property
     def d(self) -> int:
         return self.home - self.away
 
     def state(self):
-        return self.elapsed, self.d, self.pp_team, self.pp_left, self.pp_kind
+        return (self.elapsed, self.d, self.pp_team, self.pp_left, self.pp_kind,
+                self.pulled is not None)
+
+    def pull_time(self, team: str, margin: int, p: Params) -> float:
+        """Seconds left at which `team` pulls its goalie when down `margin` (1 or 2)."""
+        mean, sd = ((p.sim_pull_mean, p.sim_pull_sd) if margin == 1
+                    else (p.sim_pull2_mean, p.sim_pull2_sd))
+        return float(np.clip(mean + sd * self.pull_z[(team, margin)], 10, 1200))
+
+    def set_pulled(self, team: str | None, note: str = ""):
+        if team == self.pulled:
+            return
+        if self.pulled:
+            self.pull_spans.append((self._pull_open, self.elapsed, self.pulled))
+        self.pulled = team
+        if team:
+            self._pull_open = self.elapsed
+            self.log.append(f"{short_clock(self.elapsed)}  {team.upper()} goalie pulled{note}")
+
+    def pull_goalie(self):
+        """Trailing team pulls now (manual)."""
+        if abs(self.d) in (1, 2):
+            self.set_pulled("away" if self.d > 0 else "home", "  (manual)")
+
+    def _update_pull(self, p: Params) -> bool:
+        """Pull the trailing team's goalie once the clock reaches its pull time."""
+        if p.endgame is None or abs(self.d) not in (1, 2):
+            self.set_pulled(None)
+            return False
+        trailing = "away" if self.d > 0 else "home"
+        if self.pulled or REG - self.elapsed > self.pull_time(trailing, abs(self.d), p):
+            return False
+        self.set_pulled(trailing)
+        return True
 
     # -- events --------------------------------------------------------------
     def goal(self, team: str, note: str = ""):
@@ -215,6 +274,7 @@ class GameSim:
                 tag = tag or "SHG"
         self.log.append(f"{short_clock(self.elapsed)}  {team.upper()} goal"
                         f"{'  (' + tag + ')' if tag else ''}   {self.away}-{self.home}")
+        self.set_pulled(None)      # tie or two-goal game: goalie back in
 
     def penalty(self, on_team: str, kind: str = "minor"):
         """`on_team` is the team that gets the power play."""
@@ -233,25 +293,22 @@ class GameSim:
         """Advance one second. Returns True if an event happened."""
         if self.final:
             return False
+        event = self._update_pull(p)
         lam_s, mu_s = p.lam / REG, p.mu / REG
         rh, ra = lam_s, mu_s
-        time_left = REG - self.elapsed
         if self.pp_team == "home":
             rh, ra = lam_s * p.pp_mult * p.st_home, mu_s * p.sh_mult * p.st_away
         elif self.pp_team == "away":
             rh, ra = lam_s * p.sh_mult * p.st_home, mu_s * p.pp_mult * p.st_away
-        elif (p.endgame is not None and time_left <= p.endgame.window_seconds
-              and abs(self.d) == 1):
+        elif self.pulled:
             eg, w = p.endgame, p.endgame.window_seconds
-            if self.d == 1:
-                rh, ra = eg.e_lam_L / w, eg.e_mu_L / w
-            else:
-                rh, ra = eg.e_lam_T / w, eg.e_mu_T / w
+            rh, ra = {1: (eg.e_lam_L, eg.e_mu_L), -1: (eg.e_lam_T, eg.e_mu_T),
+                      2: (eg.e2_lead, eg.e2_trail), -2: (eg.e2_trail, eg.e2_lead)}[self.d]
+            rh, ra = rh / w, ra / w
         rp = 0.0 if self.pp_team else p.pen_rate / REG   # per team
 
         rates = np.array([rh, ra, rp, rp])
         total = rates.sum()
-        event = False
         if total > 0 and self.rng.random() < 1 - np.exp(-total):
             kind = self.rng.choice(4, p=rates / total)
             event = True
@@ -276,15 +333,14 @@ class GameSim:
         return event
 
     def _en(self, team: str, p: Params) -> bool:
-        """Goal by the leading team during the pulled-goalie window."""
-        return (not self.pp_team and abs(self.d) == 1
-                and (self.d == 1) == (team == "home")
-                and p.endgame is not None
-                and REG - self.elapsed <= p.endgame.window_seconds)
+        """Goal into the empty net (leading team, goalie pulled, no PP)."""
+        return (not self.pp_team and self.pulled is not None
+                and self.pulled != team)
 
     def _end_regulation(self, p: Params):
         self.elapsed = REG
         self.clear_pp()
+        self.set_pulled(None)
         if self.d != 0:
             self.final = "home" if self.d > 0 else "away"
             self.log.append(f"FINAL   {self.away}-{self.home}")
@@ -301,8 +357,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NHL Live WP — Skellam simulator")
-        self.geometry("1500x900")
-        self.minsize(1200, 880)
+        self.geometry("1500x980")
+        self.minsize(1200, 960)
         self.configure(bg=BG)
         self._style()
 
@@ -416,15 +472,27 @@ class App(tk.Tk):
                 r += 1
             if title.startswith("Pregame"):
                 r = self._build_st(f, r)
-            for key, label, default in specs:
+            for i, (key, label, default) in enumerate(specs):
+                # label None: second entry on the previous row (e.g. mean / sd)
+                paired = i + 1 < len(specs) and specs[i + 1][1] is None
                 var = tk.StringVar(value=default)
                 var.trace_add("write", lambda *_: self.params_changed())
-                ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
-                e = ttk.Entry(f, textvariable=var, width=9)
-                e.grid(row=r, column=1, sticky="e", padx=(10, 0))
+                if label is None:
+                    e = ttk.Entry(pair, textvariable=var, width=4)
+                    e.pack(side="left", padx=(4, 0))
+                else:
+                    ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=2)
+                    if paired:
+                        pair = tk.Frame(f, bg=PANEL)
+                        pair.grid(row=r, column=1, sticky="e", padx=(10, 0))
+                        e = ttk.Entry(pair, textvariable=var, width=4)
+                        e.pack(side="left")
+                    else:
+                        e = ttk.Entry(f, textvariable=var, width=9)
+                        e.grid(row=r, column=1, sticky="e", padx=(10, 0))
+                    r += 1
                 self.vars[key], self.entries[key] = var, e
                 self.last_good[key] = float(default)
-                r += 1
             if title.startswith("Pregame"):
                 ttk.Label(f, textvariable=self.st_info, style="Muted.TLabel",
                           justify="left").grid(row=r, column=0, columnspan=2, sticky="w")
@@ -544,7 +612,8 @@ class App(tk.Tk):
                           ("Away PP", lambda: self.inject_pp("away", "minor")),
                           ("Home 5-min PP", lambda: self.inject_pp("home", "major")),
                           ("Away 5-min PP", lambda: self.inject_pp("away", "major")),
-                          ("End PP", self.inject_clear_pp)]:
+                          ("End PP", self.inject_clear_pp),
+                          ("Pull goalie", self.inject_pull)]:
             ttk.Button(man, text=text, command=cmd).pack(side="left", padx=2)
 
     def _build_right(self, f):
@@ -573,7 +642,7 @@ class App(tk.Tk):
             try:
                 v = float(var.get())
                 ok = np.isfinite(v) and v >= 0
-                if key in ("lam", "mu", "window", "dt", "league_gf"):
+                if key in ("lam", "mu", "roll", "dt", "league_gf"):
                     ok = ok and v > 0
             except ValueError:
                 ok = False
@@ -591,12 +660,17 @@ class App(tk.Tk):
             self.entries["p_ot"].state(["!disabled"])
         eg = None
         if self.endgame_on.get():
-            eg = m.EndgameParams(vals["e_lam_L"], vals["e_mu_L"], vals["e_lam_T"],
-                                 vals["e_mu_T"], vals["window"])
+            lead1, trail1 = vals["eg_lead1"], vals["eg_trail1"]
+            eg = m.EndgameParams(lead1, trail1, trail1, lead1,
+                                 pull_seconds=vals["pull_at"], roll_seconds=vals["roll"],
+                                 e2_lead=vals["eg_lead2"], e2_trail=vals["eg_trail2"],
+                                 pull2_seconds=vals["pull2_at"])
         st_home, st_away = self.st_multipliers(vals)
         return Params(lam, mu, p_ot, vals["pp_mult"], vals["sh_mult"],
                       vals["pen_rate"], min(vals["major_pct"] / 100, 1.0),
-                      vals["dt"], eg, st_home, st_away)
+                      vals["dt"], eg, st_home, st_away,
+                      vals["sim_pull_mean"], vals["sim_pull_sd"],
+                      vals["sim_pull2_mean"], vals["sim_pull2_sd"])
 
     def st_multipliers(self, vals) -> tuple[float, float]:
         """
@@ -659,8 +733,8 @@ class App(tk.Tk):
 
     # -- evaluation & drawing -----------------------------------------------------
     def evaluate(self, p: Params, state, lines=False):
-        elapsed, d, pp_team, pp_left, pp_kind = state
-        reg = regulation_dist(p, elapsed, d, pp_team, pp_left, pp_kind)
+        elapsed, d, pp_team, pp_left, pp_kind, pulled = state
+        reg = regulation_dist(p, elapsed, d, pp_team, pp_left, pp_kind, pulled)
         probs = outcomes(reg, p.p_ot)
         if not lines:
             return probs, None
@@ -678,13 +752,14 @@ class App(tk.Tk):
 
     def next_goal_swing(self, p: Params, base_we: float):
         """Win-equiv change if home / away scores right now."""
-        elapsed, d, pp_team, pp_left, pp_kind = self.sim.state()
+        elapsed, d, pp_team, pp_left, pp_kind, _ = self.sim.state()
         out = []
         for team, dd in (("home", 1), ("away", -1)):
             team_pp, left = pp_team, pp_left
             if pp_team == team and pp_kind == "minor":
                 team_pp, left = None, 0
-            we = self.evaluate(p, (elapsed, d + dd, team_pp, left, pp_kind))[0].win_equiv
+            # a goal ends any pull
+            we = self.evaluate(p, (elapsed, d + dd, team_pp, left, pp_kind, False))[0].win_equiv
             out.append(we - base_we)
         return out
 
@@ -711,15 +786,19 @@ class App(tk.Tk):
             self.lbl_clock.config(text="FINAL/OT" if sim.ot else "FINAL")
         else:
             self.lbl_clock.config(text=clock_str(sim.elapsed))
+        pulled = f"{sim.pulled.upper()} goalie pulled" if sim.pulled else ""
         if sim.pp_team:
             self.lbl_situation.config(
                 text=f"{sim.pp_team.upper()} PP ({sim.pp_kind})  "
-                     f"{sim.pp_left // 60}:{sim.pp_left % 60:02d}",
+                     f"{sim.pp_left // 60}:{sim.pp_left % 60:02d}"
+                     + (f"  ·  {pulled}" if pulled else ""),
                 fg=HOME_C if sim.pp_team == "home" else AWAY_C)
-        elif (p.endgame and not sim.final and abs(sim.d) == 1
-              and REG - sim.elapsed <= p.endgame.window_seconds):
-            trailing = "AWAY" if sim.d == 1 else "HOME"
-            self.lbl_situation.config(text=f"{trailing} goalie pulled (endgame)", fg=YELLOW)
+        elif pulled:
+            self.lbl_situation.config(text=pulled, fg=YELLOW)
+        elif p.endgame and not sim.final and abs(sim.d) in (1, 2) and sim.elapsed >= 2400:
+            tau = int(m.assumed_pull_time(REG - sim.elapsed, p.endgame, sim.d))
+            note = f"pull assumed at {tau // 60}:{tau % 60:02d}" if tau > 0 else "no pull assumed"
+            self.lbl_situation.config(text=f"Even strength  ·  {note}", fg=MUTED)
         else:
             self.lbl_situation.config(text="Even strength", fg=MUTED)
 
@@ -791,6 +870,12 @@ class App(tk.Tk):
         for start, end, team in self.pp_spans():
             ax.axvspan(start / 60, end / 60, color=HOME_C if team == "home" else AWAY_C,
                        alpha=0.10, lw=0)
+        sim = self.sim
+        pulls = list(sim.pull_spans)
+        if sim.pulled:
+            pulls.append((sim._pull_open, sim.elapsed, sim.pulled))
+        for start, end, _team in pulls:
+            ax.axvspan(start / 60, max(end, start + 2) / 60, color=YELLOW, alpha=0.18, lw=0)
         if self.path_t:
             t, wp = np.array(self.path_t), np.array(self.path_wp)
             ax.plot(t, wp, color=WHITE, lw=1.6)
@@ -986,6 +1071,13 @@ class App(tk.Tk):
 
     def inject_pp(self, team, kind):
         self._inject(lambda: self.sim.penalty(team, kind))
+
+    def inject_pull(self):
+        """Trailing team pulls its goalie now (down 1 or 2, endgame on)."""
+        if self.read_params().endgame is None or abs(self.sim.d) not in (1, 2) or self.sim.pulled:
+            self.status.set("Pull goalie: needs a one- or two-goal game, endgame on, goalie still in")
+            return
+        self._inject(self.sim.pull_goalie)
 
     def inject_clear_pp(self):
         if self.sim.pp_team:

@@ -255,16 +255,28 @@ def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
 # In-game, the endgame rates are scaled by the share of the endgame window
 # still to play: min(T, window) / window. At the final horn the adjustment is 0.
 #
-# Defaults are rough placeholders (about a 14% tying-goal rate and ~24%
-# empty-net rate once the goalie is pulled). Fit them from play-by-play.
+# Defaults are fitted rates (see EndgameParams); this overlay applies them
+# over the last window_seconds on top of the base rates.
+
+# Fitted 2026-11-02 from 2024-25 + 2025-26 regular-season play-by-play
+# (analysis/empty_net.py): goals per 150 s of 6v5 pulled-goalie time,
+# down 1: leading team 0.92 +/- 0.05 (empty net), trailing team 0.31 +/- 0.03;
+# down 2: 0.99 +/- 0.05 and 0.30 +/- 0.03. Median pull: ~2:00 left down 1,
+# ~2:45 down 2.
 
 @dataclass
 class EndgameParams:
-    e_lam_L: float = 0.30   # home endgame xG, home leading (empty-net goals)
-    e_mu_L: float = 0.18    # away endgame xG, home leading (extra attacker)
-    e_lam_T: float = 0.18   # home endgame xG, home trailing (extra attacker)
-    e_mu_T: float = 0.30    # away endgame xG, home trailing (empty-net goals)
-    window_seconds: float = 150.0
+    e_lam_L: float = 0.92   # home endgame xG, home up 1 (empty-net goals)
+    e_mu_L: float = 0.31    # away endgame xG, home up 1 (extra attacker)
+    e_lam_T: float = 0.31   # home endgame xG, home down 1 (extra attacker)
+    e_mu_T: float = 0.92    # away endgame xG, home down 1 (empty-net goals)
+    window_seconds: float = 150.0   # e_* are xG over this many seconds pulled
+    pull_seconds: float = 120.0     # pull-time model: assumed pull, down 1 (s left) ...
+    roll_seconds: float = 30.0      # ... rolled back by this much once passed
+    # two-goal pulls (pull-time model only)
+    e2_lead: float = 0.99   # leading team xG / window, opponent down 2 and pulled
+    e2_trail: float = 0.30  # trailing team xG / window
+    pull2_seconds: float = 165.0    # assumed pull, down 2 (s left); 0 = never
 
 
 def _endgame_split(e_lead: float, e_trail: float, scale: float):
@@ -310,6 +322,133 @@ def regulation_margin_dist(lam: float, mu: float, t: float, d: int,
     if endgame is not None:
         out = apply_endgame(out, max(t, 0.0) * REG_SECONDS, endgame)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pull-time endgame model (used by the simulator)
+# ---------------------------------------------------------------------------
+# Instead of the overlay above, the goalie pull is an explicit state:
+#   - a team down 1 or 2 with its goalie pulled scores / concedes at the
+#     endgame rates (per window_seconds), which REPLACE the base rates (a
+#     power play still takes precedence);
+#   - a goal ends the pull (the new margin may be pulled again right away
+#     if its assumed pull time has passed, e.g. down 2 -> down 1 at 1:30);
+#   - a goalie not yet pulled is assumed to come out at `assumed_pull_time`:
+#     2:00 left down 1 by default; once 2:00 passes without a pull, 1:30;
+#     then 1:00, and so on (down 2: 2:45, 2:15, ...). The assumption applies
+#     to any deficit, current or future.
+# The remaining time is split at the start of the endgame: ordinary Skellam
+# (incl. any power play) up to it, then a second-by-second chain over
+# (margin, goalie pulled, PP on) to the horn.
+
+def assumed_pull_time(T_seconds: float, eg: EndgameParams, margin: int = 1) -> float:
+    """Seconds left at which a goalie not yet pulled is assumed to come out."""
+    first = eg.pull_seconds if abs(margin) == 1 else eg.pull2_seconds
+    if first <= 0:
+        return 0.0
+    if T_seconds > first:
+        return first
+    k = int(np.floor((first - T_seconds) / eg.roll_seconds)) + 1
+    return max(first - k * eg.roll_seconds, 0.0)
+
+
+_EG_PAD = 30      # chain margin grid: d +/- this
+
+
+def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
+                        eg: EndgameParams, pulled: bool = False,
+                        pull_at: float | None = None,
+                        pp_team: str | None = None, pp_seconds: float = 0.0,
+                        penalty: str = "minor",
+                        pp_mult: float = 2.3, sh_mult: float = 0.27,
+                        dt: float = 1.0,
+                        st_home: float = 1.0, st_away: float = 1.0
+                        ) -> dict[int, float]:
+    """
+    FINAL regulation margin distribution under the pull-time endgame model.
+
+    pulled  : the trailing team's goalie is out right now (used at d = +/-1, +/-2)
+    pull_at : (down 1, down 2) seconds left at which a not-yet-pulled goalie
+              comes out (default assumed_pull_time(T, eg, margin))
+    Other arguments as in remaining_diff_dist.
+    """
+    T = max(t, 0.0) * REG_SECONDS
+    if T <= 0:
+        return {d: 1.0}
+    tau1, tau2 = pull_at if pull_at is not None else (
+        assumed_pull_time(T, eg, 1), assumed_pull_time(T, eg, 2))
+    tau = max(tau1, tau2)
+    pulled = pulled and abs(d) in (1, 2)
+    pp_on = pp_team is not None and pp_seconds > 0
+    pp_end = T - pp_seconds if pp_on else -1.0     # seconds left when PP expires
+
+    # Chain from now if the goalie is out or the PP runs into the endgame,
+    # otherwise from the earliest assumed pull time.
+    S0 = T if (pulled or (pp_on and pp_end < min(T, tau))) else min(T, tau)
+
+    n_m = 2 * _EG_PAD + 1
+    margins = np.arange(d - _EG_PAD, d + _EG_PAD + 1)
+    P = np.zeros((2, 2, n_m))             # [pulled, pp on, margin]
+    if S0 < T:
+        kw = dict(pp_team=pp_team, pp_seconds=pp_seconds, penalty=penalty,
+                  pp_mult=pp_mult, sh_mult=sh_mult, dt=dt,
+                  st_home=st_home, st_away=st_away) if pp_on else {}
+        support, dist = remaining_diff_dist(lam, mu, (T - S0) / REG_SECONDS, **kw)
+        keep = np.abs(support) <= _EG_PAD
+        P[0, 0, support[keep] + _EG_PAD] = dist[keep]
+    else:
+        P[int(pulled), int(pp_on), _EG_PAD] = 1.0
+    if S0 <= 0:
+        return {int(k): float(v) for k, v in zip(margins, P.sum(axis=(0, 1))) if v > 0}
+
+    lam_s, mu_s = lam / REG_SECONDS, mu / REG_SECONDS
+    W = eg.window_seconds
+    # rates[pulled, pp] -> (home, away) per margin
+    rh = np.full((2, 2, n_m), lam_s)
+    ra = np.full((2, 2, n_m), mu_s)
+    up1, dn1 = margins == 1, margins == -1
+    up2, dn2 = margins == 2, margins == -2
+    rh[1, 0, up1], ra[1, 0, up1] = eg.e_lam_L / W, eg.e_mu_L / W
+    rh[1, 0, dn1], ra[1, 0, dn1] = eg.e_lam_T / W, eg.e_mu_T / W
+    rh[1, 0, up2], ra[1, 0, up2] = eg.e2_lead / W, eg.e2_trail / W
+    rh[1, 0, dn2], ra[1, 0, dn2] = eg.e2_trail / W, eg.e2_lead / W
+    if pp_on:
+        if pp_team == "home":
+            rh[:, 1], ra[:, 1] = lam_s * pp_mult * st_home, mu_s * sh_mult * st_away
+        else:
+            rh[:, 1], ra[:, 1] = lam_s * sh_mult * st_home, mu_s * pp_mult * st_away
+    # a PP goal ends a minor
+    home_ends_pp = pp_on and pp_team == "home" and penalty == "minor"
+    away_ends_pp = pp_on and pp_team == "away" and penalty == "minor"
+    one, two = up1 | dn1, up2 | dn2
+
+    n = max(int(np.ceil(S0 - 1e-9)), 1)
+    h = S0 / n
+    tot = rh + ra
+    pg = 1.0 - np.exp(-tot * h)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ph = np.where(tot > 0, pg * rh / tot, 0.0)
+        pa = np.where(tot > 0, pg * ra / tot, 0.0)
+    for j in range(n):
+        s = S0 - j * h                    # seconds left at the start of this step
+        if pp_on and s <= pp_end + 1e-9:  # PP expires
+            P[:, 0] += P[:, 1]
+            P[:, 1] = 0.0
+        for mask, tau_m in ((one, tau1), (two, tau2)):
+            if s <= tau_m + 1e-9:         # not-yet-pulled games at this margin pull now
+                P[1, :, mask] += P[0, :, mask]
+                P[0, :, mask] = 0.0
+        home_g, away_g = P * ph, P * pa
+        P = P - home_g - away_g
+        # any goal ends the pull; shift margins
+        for pp in (0, 1):
+            to_h = 0 if (pp == 1 and home_ends_pp) else pp
+            to_a = 0 if (pp == 1 and away_ends_pp) else pp
+            P[0, to_h, 1:] += home_g[:, pp, :-1].sum(axis=0)
+            P[0, to_a, :-1] += away_g[:, pp, 1:].sum(axis=0)
+
+    final = P.sum(axis=(0, 1))
+    return {int(k): float(v) for k, v in zip(margins, final) if v > 0}
 
 
 def _outcomes_from_margins(margins: dict[int, float], p_ot: float) -> InGameProbs:
@@ -622,3 +761,24 @@ if __name__ == "__main__":
           f"{abs(in_game_probs(lam, mu, 0.5, 1, endgame=zero_eg).win - base.win) < 1e-9}")
     print(f"  no effect at final horn:            "
           f"{in_game_probs(lam, mu, 0.0, 1, endgame=eg).win == 1.0}")
+
+    # --- Pull-time endgame model ------------------------------------------
+    print("\nPull-time endgame model, home up 1 (W / T / L / win-equiv):")
+    for label, T, pulled in [("5:00 left", 300, False), ("2:30 left, in net", 150, False),
+                             ("2:30 left, pulled", 150, True), ("1:00 left, in net", 60, False),
+                             ("1:00 left, pulled", 60, True)]:
+        dist = endgame_margin_dist(lam, mu, T / REG_SECONDS, 1, eg, pulled=pulled)
+        print(f"  {label:<20} {_outcomes_from_margins(dist, 0.5)}   "
+              f"(pull assumed at {assumed_pull_time(T, eg):.0f}s)")
+    no_pull = EndgameParams(pull_seconds=0, pull2_seconds=0)
+    eg_dists = [endgame_margin_dist(lam, mu, 0.1, 1, eg),
+                endgame_margin_dist(lam, mu, 0.05, -1, eg, pulled=True, pp_team="home",
+                                    pp_seconds=120)]
+    print(f"  pull-time model sums to 1:          "
+          f"{all(abs(sum(x.values()) - 1) < 1e-9 for x in eg_dists)}")
+    print(f"  never pulling == base model:        "
+          f"{max(abs(endgame_margin_dist(lam, mu, 0.1, 1, no_pull).get(k, 0) - v) for k, v in regulation_margin_dist(lam, mu, 0.1, 1).items()) < 1e-9}")
+    print(f"  down-1 pulls at 121/120/91/90/30s:  "
+          f"{[assumed_pull_time(x, eg) for x in (121, 120, 91, 90, 30)]}")
+    print(f"  down-2 pulls at 200/165/136/135s:   "
+          f"{[assumed_pull_time(x, eg, 2) for x in (200, 165, 136, 135)]}")

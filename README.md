@@ -12,6 +12,8 @@ model with power-play and pulled-goalie endgame adjustments.
 | `live_pricer.py` | Game state to fair prices: moneyline incl. OT, regulation 3-way, alt puck lines, live totals |
 | `live_run.py` | Headless live pricer with pluggable outputs (console, JSONL, your own callback) |
 | `live_ui.py` | Live pricing dashboard |
+| `analysis/fetch_pbp.py` | Downloads a season of NHL play-by-play to `analysis/data/` (not in git) |
+| `analysis/empty_net.py` | Measures goalie pulls, empty-net and extra-attacker rates; source of the `EndgameParams` defaults |
 
 ## Run
 
