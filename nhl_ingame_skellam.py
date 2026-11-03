@@ -268,7 +268,7 @@ def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
 # but with 0.31 the model had the leader winning 96.7% of pulled states with
 # <= 1:00 left vs 95.2% actual; 0.40 also absorbs late 6v4s and the OT edge of
 # the team that just tied.
-# Defaults set by choice (2026-11-03): leader 0.85 and trailer 0.55 in every
+# Defaults set by choice (2026-11-03): leader 0.85 (0.67 down 2) and trailer 0.55 in every
 # case (measured above: leader 0.92 / 1.08 / 0.99, trailer 0.31 / 0.33 / 0.30).
 
 @dataclass
@@ -281,7 +281,7 @@ class EndgameParams:
     pull_seconds: float = 120.0     # pull-time model: assumed pull, down 1 (s left) ...
     roll_seconds: float = 30.0      # ... rolled back by this much once passed
     # two-goal pulls (pull-time model only)
-    e2_lead: float = 0.85   # leading team xG / window, opponent down 2 and pulled
+    e2_lead: float = 0.67   # leading team xG / window, opponent down 2 and pulled
     e2_trail: float = 0.55  # trailing team xG / window
     pull2_seconds: float = 225.0    # assumed pull, down 2 (s left); 0 = never
     # final stretch, down 1 (pull-time model only): per-window rates once

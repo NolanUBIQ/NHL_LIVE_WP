@@ -112,7 +112,7 @@ SECTIONS = [
         ("eg_trail1", None, "0.55"),
         ("eg_lead1f", "Down 1, last 1:00: leader / trailer", "0.85"),
         ("eg_trail1f", None, "0.55"),
-        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "0.85"),
+        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "0.67"),
         ("eg_trail2", None, "0.55"),
         ("pull_at", "Model: pull down 1 at (s left)", "120"),
         ("pull2_at", "Model: pull down 2 at (s left)", "225"),

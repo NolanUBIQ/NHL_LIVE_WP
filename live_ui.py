@@ -57,7 +57,7 @@ PARAMS = [
         ("eg_trail1", "Down 1: trailer xG / 2:30", "0.55"),
         ("eg_lead1f", "Down 1, last 1:00: leader xG / 2:30", "0.85"),
         ("eg_trail1f", "Down 1, last 1:00: trailer xG / 2:30", "0.55"),
-        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.85"),
+        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.67"),
         ("eg_trail2", "Down 2: trailer xG / 2:30", "0.55"),
         ("pull_at", "Assumed pull, down 1 (s left)", "120"),
         ("pull2_at", "Assumed pull, down 2 (s left)", "225"),
