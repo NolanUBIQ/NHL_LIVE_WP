@@ -15,7 +15,7 @@ The simulated game uses the same assumptions as the model:
     down 1 has its own rates for the last minute) until a goal changes the
     margin. The model doesn't know the pull time:
     down 1 it assumes 2:00 left, then 1:30, 1:00, ... as each passes without
-    a pull (down 2: 2:45, 2:15, ...), and prices a pulled goalie as soon as
+    a pull (down 2: 3:45, 3:15, ...), and prices a pulled goalie as soon as
     it happens
   - a regulation tie goes to OT/SO, which home wins with probability p_ot
   - optionally, PP/SH scoring rates come from the pregame model's special-teams
@@ -84,7 +84,7 @@ class Params:
     st_away: float = 1.0
     sim_pull_mean: float = 120.0   # simulated pull time down 1, seconds left
     sim_pull_sd: float = 40.0
-    sim_pull2_mean: float = 170.0  # simulated pull time down 2
+    sim_pull2_mean: float = 225.0  # simulated pull time down 2
     sim_pull2_sd: float = 70.0
 
 
@@ -108,18 +108,18 @@ SECTIONS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("eg_lead1", "Down 1 xG / 2:30: leader (EN) / trailer", "0.65"),
-        ("eg_trail1", None, "0.31"),
-        ("eg_lead1f", "Down 1, last 1:00: leader / trailer", "0.65"),
-        ("eg_trail1f", None, "0.40"),
-        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "0.65"),
-        ("eg_trail2", None, "0.30"),
+        ("eg_lead1", "Down 1 xG / 2:30: leader (EN) / trailer", "0.85"),
+        ("eg_trail1", None, "0.55"),
+        ("eg_lead1f", "Down 1, last 1:00: leader / trailer", "0.85"),
+        ("eg_trail1f", None, "0.55"),
+        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "0.85"),
+        ("eg_trail2", None, "0.55"),
         ("pull_at", "Model: pull down 1 at (s left)", "120"),
-        ("pull2_at", "Model: pull down 2 at (s left)", "165"),
+        ("pull2_at", "Model: pull down 2 at (s left)", "225"),
         ("roll", "Model: then every (s)", "30"),
         ("sim_pull_mean", "Sim down 1: pull mean / sd", "120"),
         ("sim_pull_sd", None, "40"),
-        ("sim_pull2_mean", "Sim down 2: pull mean / sd", "170"),
+        ("sim_pull2_mean", "Sim down 2: pull mean / sd", "225"),
         ("sim_pull2_sd", None, "70"),
     ]),
 ]

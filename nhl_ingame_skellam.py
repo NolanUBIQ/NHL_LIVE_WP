@@ -262,33 +262,33 @@ def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
 # (analysis/empty_net.py): goals per 150 s of 6v5 pulled-goalie time,
 # down 1: leading team 0.92 +/- 0.05 (empty net), trailing team 0.31 +/- 0.03;
 # down 2: 0.99 +/- 0.05 and 0.30 +/- 0.03. Median pull: ~2:00 left down 1,
-# ~2:45 down 2.
+# ~2:45 down 2 (the model assumes 3:45 down 2 by choice, 2026-11-03).
 # Last minute, down 1 (refit 2026-11-03 on real game outcomes): leading team
 # 1.08 (measured EN rate), trailing team 0.40. The measured 6v5 rate is ~0.33,
 # but with 0.31 the model had the leader winning 96.7% of pulled states with
 # <= 1:00 left vs 95.2% actual; 0.40 also absorbs late 6v4s and the OT edge of
 # the team that just tied.
-# Leader (empty-net) rates set to 0.65 everywhere by choice (2026-11-03),
-# below the measured 0.92 / 1.08 / 0.99 above.
+# Defaults set by choice (2026-11-03): leader 0.85 and trailer 0.55 in every
+# case (measured above: leader 0.92 / 1.08 / 0.99, trailer 0.31 / 0.33 / 0.30).
 
 @dataclass
 class EndgameParams:
-    e_lam_L: float = 0.65   # home endgame xG, home up 1 (empty-net goals)
-    e_mu_L: float = 0.31    # away endgame xG, home up 1 (extra attacker)
-    e_lam_T: float = 0.31   # home endgame xG, home down 1 (extra attacker)
-    e_mu_T: float = 0.65    # away endgame xG, home down 1 (empty-net goals)
+    e_lam_L: float = 0.85   # home endgame xG, home up 1 (empty-net goals)
+    e_mu_L: float = 0.55    # away endgame xG, home up 1 (extra attacker)
+    e_lam_T: float = 0.55   # home endgame xG, home down 1 (extra attacker)
+    e_mu_T: float = 0.85    # away endgame xG, home down 1 (empty-net goals)
     window_seconds: float = 150.0   # e_* are xG over this many seconds pulled
     pull_seconds: float = 120.0     # pull-time model: assumed pull, down 1 (s left) ...
     roll_seconds: float = 30.0      # ... rolled back by this much once passed
     # two-goal pulls (pull-time model only)
-    e2_lead: float = 0.65   # leading team xG / window, opponent down 2 and pulled
-    e2_trail: float = 0.30  # trailing team xG / window
-    pull2_seconds: float = 165.0    # assumed pull, down 2 (s left); 0 = never
+    e2_lead: float = 0.85   # leading team xG / window, opponent down 2 and pulled
+    e2_trail: float = 0.55  # trailing team xG / window
+    pull2_seconds: float = 225.0    # assumed pull, down 2 (s left); 0 = never
     # final stretch, down 1 (pull-time model only): per-window rates once
     # final_seconds or less are left; final_seconds = 0 turns it off
     final_seconds: float = 60.0
-    final_lead: float = 0.65
-    final_trail: float = 0.40
+    final_lead: float = 0.85
+    final_trail: float = 0.55
 
 
 def pulled_rates(eg: EndgameParams, final: bool = False) -> dict[int, tuple[float, float]]:
@@ -357,7 +357,7 @@ def regulation_margin_dist(lam: float, mu: float, t: float, d: int,
 #     if its assumed pull time has passed, e.g. down 2 -> down 1 at 1:30);
 #   - a goalie not yet pulled is assumed to come out at `assumed_pull_time`:
 #     2:00 left down 1 by default; once 2:00 passes without a pull, 1:30;
-#     then 1:00, and so on (down 2: 2:45, 2:15, ...). The assumption applies
+#     then 1:00, and so on (down 2: 3:45, 3:15, ...). The assumption applies
 #     to any deficit, current or future.
 # The remaining time is split at the start of the endgame: ordinary Skellam
 # (incl. any power play) up to it, then a second-by-second chain over
@@ -905,5 +905,5 @@ if __name__ == "__main__":
           f"{max(abs(endgame_margin_dist(lam, mu, 0.1, 1, no_pull).get(k, 0) - v) for k, v in regulation_margin_dist(lam, mu, 0.1, 1).items()) < 1e-9}")
     print(f"  down-1 pulls at 121/120/91/90/30s:  "
           f"{[assumed_pull_time(x, eg) for x in (121, 120, 91, 90, 30)]}")
-    print(f"  down-2 pulls at 200/165/136/135s:   "
-          f"{[assumed_pull_time(x, eg, 2) for x in (200, 165, 136, 135)]}")
+    print(f"  down-2 pulls at 260/225/196/195s:   "
+          f"{[assumed_pull_time(x, eg, 2) for x in (260, 225, 196, 195)]}")
