@@ -11,8 +11,9 @@ The simulated game uses the same assumptions as the model:
     base * pp_mult and the SH team at base * sh_mult; a PP goal ends a minor
   - with the endgame on, a team down one or two pulls its goalie at its own
     random pull time (or by hand); while pulled, scoring switches to the
-    endgame rates (fitted from NHL play-by-play, see analysis/empty_net.py)
-    until a goal changes the margin. The model doesn't know the pull time:
+    endgame rates (fitted from NHL play-by-play, see analysis/empty_net.py;
+    down 1 has its own rates for the last minute) until a goal changes the
+    margin. The model doesn't know the pull time:
     down 1 it assumes 2:00 left, then 1:30, 1:00, ... as each passes without
     a pull (down 2: 2:45, 2:15, ...), and prices a pulled goalie as soon as
     it happens
@@ -107,10 +108,12 @@ SECTIONS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "0.92"),
-        ("eg_trail1", "Down 1: trailer xG / 2:30", "0.31"),
-        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.99"),
-        ("eg_trail2", "Down 2: trailer xG / 2:30", "0.30"),
+        ("eg_lead1", "Down 1 xG / 2:30: leader (EN) / trailer", "0.65"),
+        ("eg_trail1", None, "0.31"),
+        ("eg_lead1f", "Down 1, last 1:00: leader / trailer", "0.65"),
+        ("eg_trail1f", None, "0.40"),
+        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "0.65"),
+        ("eg_trail2", None, "0.30"),
         ("pull_at", "Model: pull down 1 at (s left)", "120"),
         ("pull2_at", "Model: pull down 2 at (s left)", "165"),
         ("roll", "Model: then every (s)", "30"),
@@ -302,8 +305,8 @@ class GameSim:
             rh, ra = lam_s * p.sh_mult * p.st_home, mu_s * p.pp_mult * p.st_away
         elif self.pulled:
             eg, w = p.endgame, p.endgame.window_seconds
-            rh, ra = {1: (eg.e_lam_L, eg.e_mu_L), -1: (eg.e_lam_T, eg.e_mu_T),
-                      2: (eg.e2_lead, eg.e2_trail), -2: (eg.e2_trail, eg.e2_lead)}[self.d]
+            final = REG - self.elapsed <= eg.final_seconds
+            rh, ra = m.pulled_rates(eg, final)[self.d]
             rh, ra = rh / w, ra / w
         rp = 0.0 if self.pp_team else p.pen_rate / REG   # per team
 
@@ -664,7 +667,8 @@ class App(tk.Tk):
             eg = m.EndgameParams(lead1, trail1, trail1, lead1,
                                  pull_seconds=vals["pull_at"], roll_seconds=vals["roll"],
                                  e2_lead=vals["eg_lead2"], e2_trail=vals["eg_trail2"],
-                                 pull2_seconds=vals["pull2_at"])
+                                 pull2_seconds=vals["pull2_at"],
+                                 final_lead=vals["eg_lead1f"], final_trail=vals["eg_trail1f"])
         st_home, st_away = self.st_multipliers(vals)
         return Params(lam, mu, p_ot, vals["pp_mult"], vals["sh_mult"],
                       vals["pen_rate"], min(vals["major_pct"] / 100, 1.0),

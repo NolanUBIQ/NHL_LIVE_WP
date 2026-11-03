@@ -53,9 +53,11 @@ PARAMS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "0.92"),
+        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "0.65"),
         ("eg_trail1", "Down 1: trailer xG / 2:30", "0.31"),
-        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.99"),
+        ("eg_lead1f", "Down 1, last 1:00: leader xG / 2:30", "0.65"),
+        ("eg_trail1f", "Down 1, last 1:00: trailer xG / 2:30", "0.40"),
+        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.65"),
         ("eg_trail2", "Down 2: trailer xG / 2:30", "0.30"),
         ("pull_at", "Assumed pull, down 1 (s left)", "120"),
         ("pull2_at", "Assumed pull, down 2 (s left)", "165"),
@@ -76,8 +78,8 @@ class LiveApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NHL Live WP — live pricer")
-        self.geometry("1560x920")
-        self.minsize(1300, 880)
+        self.geometry("1560x960")
+        self.minsize(1300, 925)
         self.configure(bg=BG)
         self._style()
 
@@ -429,7 +431,9 @@ class LiveApp(tk.Tk):
                                  pull_seconds=self._num("pull_at"),
                                  roll_seconds=self._num("roll", positive=True),
                                  e2_lead=self._num("eg_lead2"), e2_trail=self._num("eg_trail2"),
-                                 pull2_seconds=self._num("pull2_at"))
+                                 pull2_seconds=self._num("pull2_at"),
+                                 final_lead=self._num("eg_lead1f"),
+                                 final_trail=self._num("eg_trail1f"))
         try:
             ladder = tuple(float(x) for x in self.ladder_var.get().replace(";", ",").split(",")
                            if x.strip())

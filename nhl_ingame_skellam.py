@@ -263,20 +263,40 @@ def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
 # down 1: leading team 0.92 +/- 0.05 (empty net), trailing team 0.31 +/- 0.03;
 # down 2: 0.99 +/- 0.05 and 0.30 +/- 0.03. Median pull: ~2:00 left down 1,
 # ~2:45 down 2.
+# Last minute, down 1 (refit 2026-11-03 on real game outcomes): leading team
+# 1.08 (measured EN rate), trailing team 0.40. The measured 6v5 rate is ~0.33,
+# but with 0.31 the model had the leader winning 96.7% of pulled states with
+# <= 1:00 left vs 95.2% actual; 0.40 also absorbs late 6v4s and the OT edge of
+# the team that just tied.
+# Leader (empty-net) rates set to 0.65 everywhere by choice (2026-11-03),
+# below the measured 0.92 / 1.08 / 0.99 above.
 
 @dataclass
 class EndgameParams:
-    e_lam_L: float = 0.92   # home endgame xG, home up 1 (empty-net goals)
+    e_lam_L: float = 0.65   # home endgame xG, home up 1 (empty-net goals)
     e_mu_L: float = 0.31    # away endgame xG, home up 1 (extra attacker)
     e_lam_T: float = 0.31   # home endgame xG, home down 1 (extra attacker)
-    e_mu_T: float = 0.92    # away endgame xG, home down 1 (empty-net goals)
+    e_mu_T: float = 0.65    # away endgame xG, home down 1 (empty-net goals)
     window_seconds: float = 150.0   # e_* are xG over this many seconds pulled
     pull_seconds: float = 120.0     # pull-time model: assumed pull, down 1 (s left) ...
     roll_seconds: float = 30.0      # ... rolled back by this much once passed
     # two-goal pulls (pull-time model only)
-    e2_lead: float = 0.99   # leading team xG / window, opponent down 2 and pulled
+    e2_lead: float = 0.65   # leading team xG / window, opponent down 2 and pulled
     e2_trail: float = 0.30  # trailing team xG / window
     pull2_seconds: float = 165.0    # assumed pull, down 2 (s left); 0 = never
+    # final stretch, down 1 (pull-time model only): per-window rates once
+    # final_seconds or less are left; final_seconds = 0 turns it off
+    final_seconds: float = 60.0
+    final_lead: float = 0.65
+    final_trail: float = 0.45
+
+
+def pulled_rates(eg: EndgameParams, final: bool = False) -> dict[int, tuple[float, float]]:
+    """Home margin -> (home, away) xG per window_seconds with the trailing goalie pulled."""
+    lead, trail = (eg.final_lead, eg.final_trail) if final else (eg.e_lam_L, eg.e_mu_L)
+    tlead, ttrail = (eg.final_lead, eg.final_trail) if final else (eg.e_mu_T, eg.e_lam_T)
+    return {1: (lead, trail), -1: (ttrail, tlead),
+            2: (eg.e2_lead, eg.e2_trail), -2: (eg.e2_trail, eg.e2_lead)}
 
 
 def _endgame_split(e_lead: float, e_trail: float, scale: float):
@@ -331,6 +351,8 @@ def regulation_margin_dist(lam: float, mu: float, t: float, d: int,
 #   - a team down 1 or 2 with its goalie pulled scores / concedes at the
 #     endgame rates (per window_seconds), which REPLACE the base rates (a
 #     power play still takes precedence);
+#   - in the last final_seconds (1:00) down 1, both teams use the final_*
+#     rates instead;
 #   - a goal ends the pull (the new margin may be pulled again right away
 #     if its assumed pull time has passed, e.g. down 2 -> down 1 at 1:30);
 #   - a goalie not yet pulled is assumed to come out at `assumed_pull_time`:
@@ -353,6 +375,15 @@ def assumed_pull_time(T_seconds: float, eg: EndgameParams, margin: int = 1) -> f
 
 
 _EG_PAD = 30      # chain margin grid: d +/- this
+
+
+def _step_probs(rh: np.ndarray, ra: np.ndarray, h: float):
+    """Per-step (home goal, away goal) probabilities from rates over h seconds."""
+    tot = rh + ra
+    pg = 1.0 - np.exp(-tot * h)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (np.where(tot > 0, pg * rh / tot, 0.0),
+                np.where(tot > 0, pg * ra / tot, 0.0))
 
 
 def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
@@ -408,10 +439,6 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
     ra = np.full((2, 2, n_m), mu_s)
     up1, dn1 = margins == 1, margins == -1
     up2, dn2 = margins == 2, margins == -2
-    rh[1, 0, up1], ra[1, 0, up1] = eg.e_lam_L / W, eg.e_mu_L / W
-    rh[1, 0, dn1], ra[1, 0, dn1] = eg.e_lam_T / W, eg.e_mu_T / W
-    rh[1, 0, up2], ra[1, 0, up2] = eg.e2_lead / W, eg.e2_trail / W
-    rh[1, 0, dn2], ra[1, 0, dn2] = eg.e2_trail / W, eg.e2_lead / W
     if pp_on:
         if pp_team == "home":
             rh[:, 1], ra[:, 1] = lam_s * pp_mult * st_home, mu_s * sh_mult * st_away
@@ -424,13 +451,15 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
 
     n = max(int(np.ceil(S0 - 1e-9)), 1)
     h = S0 / n
-    tot = rh + ra
-    pg = 1.0 - np.exp(-tot * h)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        ph = np.where(tot > 0, pg * rh / tot, 0.0)
-        pa = np.where(tot > 0, pg * ra / tot, 0.0)
+    steps = []                            # (ph, pa) before / inside the final stretch
+    for final in (False, True):
+        rh_f, ra_f = rh.copy(), ra.copy()
+        for margin, (eh, ea) in pulled_rates(eg, final).items():
+            rh_f[1, 0, margins == margin], ra_f[1, 0, margins == margin] = eh / W, ea / W
+        steps.append(_step_probs(rh_f, ra_f, h))
     for j in range(n):
         s = S0 - j * h                    # seconds left at the start of this step
+        ph, pa = steps[s <= eg.final_seconds + 1e-9]
         if pp_on and s <= pp_end + 1e-9:  # PP expires
             P[:, 0] += P[:, 1]
             P[:, 1] = 0.0
@@ -512,11 +541,6 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
     M = d + k[:, None] - k[None, :]      # margin in each cell
     rh = np.full((2, 2, G + 1, G + 1), lam_s)
     ra = np.full((2, 2, G + 1, G + 1), mu_s)
-    for margin, (eh, ea) in {1: (eg.e_lam_L, eg.e_mu_L), -1: (eg.e_lam_T, eg.e_mu_T),
-                             2: (eg.e2_lead, eg.e2_trail),
-                             -2: (eg.e2_trail, eg.e2_lead)}.items():
-        mask = M == margin
-        rh[1, 0][mask], ra[1, 0][mask] = eh / W, ea / W
     if pp_on:
         rh[:, 1], ra[:, 1] = pp_h, pp_a
     home_ends_pp = pp_on and pp_team == "home" and penalty == "minor"
@@ -525,13 +549,16 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
 
     n = max(int(np.ceil(S0 - 1e-9)), 1)
     h = S0 / n
-    tot = rh + ra
-    pg = 1.0 - np.exp(-tot * h)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        ph = np.where(tot > 0, pg * rh / tot, 0.0)
-        pa = np.where(tot > 0, pg * ra / tot, 0.0)
+    steps = []
+    for final in (False, True):
+        rh_f, ra_f = rh.copy(), ra.copy()
+        for margin, (eh, ea) in pulled_rates(eg, final).items():
+            mask = M == margin
+            rh_f[1, 0][mask], ra_f[1, 0][mask] = eh / W, ea / W
+        steps.append(_step_probs(rh_f, ra_f, h))
     for j in range(n):
         s = S0 - j * h
+        ph, pa = steps[s <= eg.final_seconds + 1e-9]
         if pp_on and s <= pp_end + 1e-9:
             P[:, 0] += P[:, 1]
             P[:, 1] = 0.0
