@@ -288,7 +288,7 @@ class EndgameParams:
     # final_seconds or less are left; final_seconds = 0 turns it off
     final_seconds: float = 60.0
     final_lead: float = 0.65
-    final_trail: float = 0.45
+    final_trail: float = 0.40
 
 
 def pulled_rates(eg: EndgameParams, final: bool = False) -> dict[int, tuple[float, float]]:
