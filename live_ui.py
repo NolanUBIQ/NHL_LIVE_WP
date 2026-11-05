@@ -53,15 +53,19 @@ PARAMS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "0.85"),
-        ("eg_trail1", "Down 1: trailer xG / 2:30", "0.55"),
-        ("eg_lead1f", "Down 1, last 1:00: leader xG / 2:30", "0.85"),
-        ("eg_trail1f", "Down 1, last 1:00: trailer xG / 2:30", "0.55"),
-        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "0.67"),
-        ("eg_trail2", "Down 2: trailer xG / 2:30", "0.55"),
+        ("eg_lead1", "Down 1: leader (EN) xG / 2:30", "1.05"),
+        ("eg_trail1", "Down 1: trailer xG / 2:30", "0.37"),
+        ("eg_lead1f", "Down 1, last 1:00: leader xG / 2:30", "1.05"),
+        ("eg_trail1f", "Down 1, last 1:00: trailer xG / 2:30", "0.37"),
+        ("eg_lead2", "Down 2: leader (EN) xG / 2:30", "1.03"),
+        ("eg_trail2", "Down 2: trailer xG / 2:30", "0.31"),
         ("pull_at", "Assumed pull, down 1 (s left)", "120"),
-        ("pull2_at", "Assumed pull, down 2 (s left)", "225"),
+        ("pull2_at", "Assumed pull, down 2 (s left)", "200"),
         ("roll", "Then every (s)", "30"),
+        ("repull_delay", "Re-pull after a goal (s)", "25"),
+        ("repull2_cutoff", "No re-pull down 2, last (s)", "60"),
+        ("sfx_trail1", "3rd-period trailer rate ×, down 1", "1.00"),
+        ("sfx_trail2", "3rd-period trailer rate ×, down 2", "1.26"),
     ]),
 ]
 
@@ -78,8 +82,8 @@ class LiveApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NHL Live WP — live pricer")
-        self.geometry("1560x960")
-        self.minsize(1300, 925)
+        self.geometry("1560x1050")
+        self.minsize(1300, 1015)
         self.configure(bg=BG)
         self._style()
 
@@ -433,7 +437,11 @@ class LiveApp(tk.Tk):
                                  e2_lead=self._num("eg_lead2"), e2_trail=self._num("eg_trail2"),
                                  pull2_seconds=self._num("pull2_at"),
                                  final_lead=self._num("eg_lead1f"),
-                                 final_trail=self._num("eg_trail1f"))
+                                 final_trail=self._num("eg_trail1f"),
+                                 repull_delay=self._num("repull_delay"),
+                                 repull2_cutoff=self._num("repull2_cutoff"),
+                                 sfx_trail1=self._num("sfx_trail1"),
+                                 sfx_trail2=self._num("sfx_trail2"))
         try:
             ladder = tuple(float(x) for x in self.ladder_var.get().replace(";", ",").split(",")
                            if x.strip())

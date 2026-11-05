@@ -13,10 +13,13 @@ The simulated game uses the same assumptions as the model:
     random pull time (or by hand); while pulled, scoring switches to the
     endgame rates (fitted from NHL play-by-play, see analysis/empty_net.py;
     down 1 has its own rates for the last minute) until a goal changes the
-    margin. The model doesn't know the pull time:
+    margin; after a goal the goalie re-pulls ~25 s later (down 2 in the last
+    minute it stays in). The model doesn't know the pull time:
     down 1 it assumes 2:00 left, then 1:30, 1:00, ... as each passes without
-    a pull (down 2: 3:45, 3:15, ...), and prices a pulled goalie as soon as
+    a pull (down 2: 3:20, 2:50, ...), and prices a pulled goalie as soon as
     it happens
+  - score effects: in the 3rd period a team down 1 or 2 (goalie in, no PP)
+    scores at its base rate x the score-effect multiplier
   - a regulation tie goes to OT/SO, which home wins with probability p_ot
   - optionally, PP/SH scoring rates come from the pregame model's special-teams
     ratings for the chosen teams (see pregame_st.py)
@@ -84,7 +87,7 @@ class Params:
     st_away: float = 1.0
     sim_pull_mean: float = 120.0   # simulated pull time down 1, seconds left
     sim_pull_sd: float = 40.0
-    sim_pull2_mean: float = 225.0  # simulated pull time down 2
+    sim_pull2_mean: float = 200.0  # simulated pull time down 2
     sim_pull2_sd: float = 70.0
 
 
@@ -108,18 +111,22 @@ SECTIONS = [
         ("league_gf", "League GF / team / 60", "3.05"),
     ]),
     ("Endgame (pulled goalie)", [
-        ("eg_lead1", "Down 1 xG / 2:30: leader (EN) / trailer", "0.85"),
-        ("eg_trail1", None, "0.55"),
-        ("eg_lead1f", "Down 1, last 1:00: leader / trailer", "0.85"),
-        ("eg_trail1f", None, "0.55"),
-        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "0.67"),
-        ("eg_trail2", None, "0.55"),
+        ("eg_lead1", "Down 1 xG / 2:30: leader (EN) / trailer", "1.05"),
+        ("eg_trail1", None, "0.37"),
+        ("eg_lead1f", "Down 1, last 1:00: leader / trailer", "1.05"),
+        ("eg_trail1f", None, "0.37"),
+        ("eg_lead2", "Down 2 xG / 2:30: leader / trailer", "1.03"),
+        ("eg_trail2", None, "0.31"),
+        ("repull_delay", "Re-pull after goal (s) / none down 2 last", "25"),
+        ("repull2_cutoff", None, "60"),
+        ("sfx_trail1", "3rd-period trailer rate ×: down 1 / 2", "1.00"),
+        ("sfx_trail2", None, "1.26"),
         ("pull_at", "Model: pull down 1 at (s left)", "120"),
-        ("pull2_at", "Model: pull down 2 at (s left)", "225"),
+        ("pull2_at", "Model: pull down 2 at (s left)", "200"),
         ("roll", "Model: then every (s)", "30"),
         ("sim_pull_mean", "Sim down 1: pull mean / sd", "120"),
         ("sim_pull_sd", None, "40"),
-        ("sim_pull2_mean", "Sim down 2: pull mean / sd", "225"),
+        ("sim_pull2_mean", "Sim down 2: pull mean / sd", "200"),
         ("sim_pull2_sd", None, "70"),
     ]),
 ]
@@ -217,6 +224,9 @@ class GameSim:
         z = np.random.default_rng(None if seed is None else [seed, 7]).standard_normal(4)
         self.pull_z = {("home", 1): z[0], ("away", 1): z[1],
                        ("home", 2): z[2], ("away", 2): z[3]}
+        self.delay_rng = np.random.default_rng(None if seed is None else [seed, 11])
+        self.repull_at = 0                 # no pull before this elapsed second
+        self.repull_mean = 25.0            # mean re-pull delay (set from params each step)
         self.pulled: str | None = None     # team whose goalie is out
         self.pull_spans: list[tuple[int, int, str]] = []
         self._pull_open = 0
@@ -256,7 +266,10 @@ class GameSim:
             self.set_pulled(None)
             return False
         trailing = "away" if self.d > 0 else "home"
-        if self.pulled or REG - self.elapsed > self.pull_time(trailing, abs(self.d), p):
+        left = REG - self.elapsed
+        if (self.pulled or left > self.pull_time(trailing, abs(self.d), p)
+                or self.elapsed < self.repull_at
+                or (abs(self.d) == 2 and left <= p.endgame.repull2_cutoff)):
             return False
         self.set_pulled(trailing)
         return True
@@ -277,7 +290,10 @@ class GameSim:
                 tag = tag or "SHG"
         self.log.append(f"{short_clock(self.elapsed)}  {team.upper()} goal"
                         f"{'  (' + tag + ')' if tag else ''}   {self.away}-{self.home}")
-        self.set_pulled(None)      # tie or two-goal game: goalie back in
+        self.set_pulled(None)      # goalie back in for the faceoff
+        # re-pull (if still down 1 or 2) after an exponential delay
+        self.repull_at = self.elapsed + 1 + int(round(self.delay_rng.exponential(
+            self.repull_mean))) if self.repull_mean > 0 else 0
 
     def penalty(self, on_team: str, kind: str = "minor"):
         """`on_team` is the team that gets the power play."""
@@ -296,6 +312,7 @@ class GameSim:
         """Advance one second. Returns True if an event happened."""
         if self.final:
             return False
+        self.repull_mean = p.endgame.repull_delay if p.endgame else 0.0
         event = self._update_pull(p)
         lam_s, mu_s = p.lam / REG, p.mu / REG
         rh, ra = lam_s, mu_s
@@ -308,6 +325,10 @@ class GameSim:
             final = REG - self.elapsed <= eg.final_seconds
             rh, ra = m.pulled_rates(eg, final)[self.d]
             rh, ra = rh / w, ra / w
+        elif (p.endgame is not None and abs(self.d) in (1, 2)
+              and REG - self.elapsed <= p.endgame.sfx_seconds):
+            fh, fa = m.score_effects(p.endgame)[self.d]
+            rh, ra = lam_s * fh, mu_s * fa
         rp = 0.0 if self.pp_team else p.pen_rate / REG   # per team
 
         rates = np.array([rh, ra, rp, rp])
@@ -360,8 +381,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NHL Live WP — Skellam simulator")
-        self.geometry("1500x980")
-        self.minsize(1200, 960)
+        self.geometry("1500x1060")
+        self.minsize(1200, 1040)
         self.configure(bg=BG)
         self._style()
 
@@ -668,7 +689,10 @@ class App(tk.Tk):
                                  pull_seconds=vals["pull_at"], roll_seconds=vals["roll"],
                                  e2_lead=vals["eg_lead2"], e2_trail=vals["eg_trail2"],
                                  pull2_seconds=vals["pull2_at"],
-                                 final_lead=vals["eg_lead1f"], final_trail=vals["eg_trail1f"])
+                                 final_lead=vals["eg_lead1f"], final_trail=vals["eg_trail1f"],
+                                 sfx_trail1=vals["sfx_trail1"], sfx_trail2=vals["sfx_trail2"],
+                                 repull_delay=vals["repull_delay"],
+                                 repull2_cutoff=vals["repull2_cutoff"])
         st_home, st_away = self.st_multipliers(vals)
         return Params(lam, mu, p_ot, vals["pp_mult"], vals["sh_mult"],
                       vals["pen_rate"], min(vals["major_pct"] / 100, 1.0),

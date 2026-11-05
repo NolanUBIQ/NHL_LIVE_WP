@@ -17,9 +17,10 @@ as the sim UI.
 Game situations:
   - regulation: nhl_ingame_skellam.endgame_margin_dist with the live score,
     clock, PP window (minor / major) and pull-time endgame model: a team
-    down 1 or 2 is assumed to pull at 2:00 / 3:45 left (rolled back 30 s
-    each time that passes), and the feed's goalie-out flag switches to the
-    pulled state as soon as it happens
+    down 1 or 2 is assumed to pull at 2:00 / 3:20 left (rolled back 30 s
+    each time that passes), re-pulls ~25 s after a goal, and the feed's
+    goalie-out flag switches to the pulled state as soon as it happens;
+    3rd-period score effects raise the trailing team's rate down 1 / 2
   - 5-on-3: the PP multiplier is the time-weighted mix of pp53_mult (two-man
     portion) and pp_mult over the whole advantage
   - OT / shootout: the game is tied, so home wins with p_ot
