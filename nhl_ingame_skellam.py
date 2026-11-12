@@ -351,6 +351,12 @@ def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
 #     2.59 / 60 down 1 and 3.02 down 2 vs 2.39 in a tied 3rd (x1.08, x1.26),
 #     leading team ~unchanged; no clear goal effect in P1-P2 (sfx_seconds 1200).
 #     Down 1 left at x1.0 by choice (2026-11-05); only down 2 is boosted.
+#   pulled with a PP on (2026-11-12, down 1 + 2 pooled, 2024-25 .. 2026-27):
+#     6v4 (trailing team's PP): leader EN 0.51 +/- 0.09, trailer 0.54 +/- 0.09
+#     (2.9 h); 5v5 (trailing team shorthanded): leader EN 1.89 +/- 0.46,
+#     trailer 0.11 +/- 0.11 (0.4 h), shrunk to 1.5 / 0.15. The plain PP
+#     rates used before gave the leader ~0.03 at 6v4. Pull times on a PP
+#     match 6v5 down 1 (median 2:00); down 2 ~25 s earlier, n = 66, not modelled.
 #   With these, lead-1 / lead-2 states from 40:00 to 6:00 left are priced
 #   within ~1.3 pts on the moneyline and ~1.5 pts on -1.5 / -2.5 on average.
 
@@ -384,6 +390,32 @@ class EndgameParams:
     # at once); down 2 with repull2_cutoff s or less left, no re-pull
     repull_delay: float = 25.0
     repull2_cutoff: float = 60.0
+    # pulled with a power play on (pull-time model only), xG / window, down 1
+    # and 2 pooled; None for a pair = plain PP rates (the old behaviour)
+    #   6v4: the trailing team is on the PP and pulls
+    pp_pull_lead: float | None = 0.51   # leading (shorthanded) team, empty net
+    pp_pull_trail: float | None = 0.54  # trailing team
+    #   5v5: the trailing team is shorthanded and pulls anyway
+    sh_pull_lead: float | None = 1.5    # leading (PP) team, empty net
+    sh_pull_trail: float | None = 0.15  # trailing team
+
+
+def pulled_pp_rates(eg: EndgameParams, pp_team: str) -> dict[int, tuple[float, float]]:
+    """
+    Home margin -> (home, away) xG per window_seconds with the trailing goalie
+    pulled while `pp_team` has a power play: 6v4 if the trailing team has
+    it, 5v5 into an empty net if the leading team has it. Margins whose pair
+    is None are left out (they keep the PP rates).
+    """
+    out = {}
+    for margin in (1, -1, 2, -2):
+        trailing = "home" if margin < 0 else "away"
+        lead, trail = ((eg.pp_pull_lead, eg.pp_pull_trail) if pp_team == trailing
+                       else (eg.sh_pull_lead, eg.sh_pull_trail))
+        if lead is None or trail is None:
+            continue
+        out[margin] = (lead, trail) if margin > 0 else (trail, lead)
+    return out
 
 
 def score_effects(eg: EndgameParams) -> dict[int, tuple[float, float]]:
@@ -455,8 +487,9 @@ def regulation_margin_dist(lam: float, mu: float, t: float, d: int,
 # ---------------------------------------------------------------------------
 # Instead of the overlay above, the goalie pull is an explicit state:
 #   - a team down 1 or 2 with its goalie pulled scores / concedes at the
-#     endgame rates (per window_seconds), which REPLACE the base rates (a
-#     power play still takes precedence);
+#     endgame rates (per window_seconds), which REPLACE the base rates; with
+#     a power play on, the 6v4 / 5v5 pulled-PP rates replace the PP rates
+#     (pulled_pp_rates);
 #   - in the last final_seconds (1:00) down 1, both teams use the final_*
 #     rates instead;
 #   - a goal ends the pull (the new margin may be pulled again right away
@@ -646,6 +679,10 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
                     ra_f[0::2, 0, margins == margin] *= fa
             for margin, (eh, ea) in pulled_rates(eg, final).items():
                 rh_f[1, 0, margins == margin], ra_f[1, 0, margins == margin] = eh / W, ea / W
+            if pp_on:                     # pulled during the PP: 6v4 / 5v5 rates
+                for margin, (eh, ea) in pulled_pp_rates(eg, pp_team).items():
+                    rh_f[1, 1:, margins == margin] = eh / W
+                    ra_f[1, 1:, margins == margin] = ea / W
             steps[in_fx, final] = _step_probs(rh_f, ra_f, h)
     for j in range(n):
         s = S0 - j * h                    # seconds left at the start of this step
@@ -757,6 +794,10 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
             for margin, (eh, ea) in pulled_rates(eg, final).items():
                 mask = M == margin
                 rh_f[1, 0][mask], ra_f[1, 0][mask] = eh / W, ea / W
+            if pp_on:
+                for margin, (eh, ea) in pulled_pp_rates(eg, pp_team).items():
+                    mask = M == margin
+                    rh_f[1, 1:][:, mask], ra_f[1, 1:][:, mask] = eh / W, ea / W
             steps[in_fx, final] = _step_probs(rh_f, ra_f, h)
     for j in range(n):
         s = S0 - j * h
@@ -1144,7 +1185,9 @@ if __name__ == "__main__":
     # reproduce the Skellam double minor
     r150 = 3.0 * 150 / REG_SECONDS
     flat = EndgameParams(r150, r150, r150, r150, e2_lead=r150, e2_trail=r150,
-                         final_lead=r150, final_trail=r150, sfx_seconds=0)
+                         final_lead=r150, final_trail=r150, sfx_seconds=0,
+                         pp_pull_lead=None, pp_pull_trail=None,      # PP rates
+                         sh_pull_lead=None, sh_pull_trail=None)      # while pulled
     chain_gap = max(_gap(
         endgame_margin_dist(3.0, 3.0, T / REG_SECONDS, dd, flat, pull_at=(T, T),
                             pp_team=team, pp_seconds=secs, penalty="double"),
@@ -1161,4 +1204,34 @@ if __name__ == "__main__":
     print(f"  second half (<= 2:00) == minor:     {second_half}")
     print(f"  multipliers=1 matches base:         {neutral_dbl < 1e-4}  ({neutral_dbl:.1e})")
     print(f"  chain == Skellam at base rates:     {chain_gap < 1e-3}  ({chain_gap:.1e})")
+    print(f"  totals chain margins == margin chain: {tot_gap < 1e-6}")
+
+    # --- Pulled with a power play on --------------------------------------
+    print("\nPulled with a PP on (home win-equiv, plain PP rates -> 6v4 / 5v5 rates):")
+    from dataclasses import replace as _replace
+    old_eg = _replace(eg, pp_pull_lead=None, pp_pull_trail=None,
+                      sh_pull_lead=None, sh_pull_trail=None)
+    pp_states = [("home down 1, 1:30 left, home PP, pulled (6v4)", 90, -1, "home"),
+                 ("home up 1, 1:30 left, home PP, away pulled (5v5)", 90, 1, "home"),
+                 ("home up 1, 1:00 left, away PP, away pulled (6v4)", 60, 1, "away")]
+    for label, T, dd, team in pp_states:
+        a, b = (_outcomes_from_margins(endgame_margin_dist(
+            lam, mu, T / REG_SECONDS, dd, e, pulled=True, pp_team=team, pp_seconds=60), 0.5)
+            for e in (old_eg, eg))
+        print(f"  {label:<50} {a.win_equiv:.3f} -> {b.win_equiv:.3f}")
+    # rates set to exactly the PP rates must reproduce the plain-PP chain
+    W = eg.window_seconds
+    pp_h, sh_a = lam / REG_SECONDS * 2.3 * W, mu / REG_SECONDS * 0.27 * W
+    as_pp = _replace(eg, pp_pull_lead=sh_a, pp_pull_trail=pp_h,   # home trails, home PP
+                     sh_pull_lead=pp_h, sh_pull_trail=sh_a)       # home leads, home PP
+    wiring = max(_gap(
+        endgame_margin_dist(lam, mu, 0.03, dd, as_pp, pulled=True, pp_team="home", pp_seconds=60),
+        endgame_margin_dist(lam, mu, 0.03, dd, old_eg, pulled=True, pp_team="home", pp_seconds=60))
+        for dd in (-2, -1, 1, 2))
+    J = endgame_goals_dist(lam, mu, 0.025, -1, eg, pulled=True, pp_team="home",
+                           pp_seconds=60, max_goals=20)
+    hh, aa = np.indices(J.shape)
+    mg = endgame_margin_dist(lam, mu, 0.025, -1, eg, pulled=True, pp_team="home", pp_seconds=60)
+    tot_gap = max(abs(J[hh - aa - 1 == k].sum() - v) for k, v in mg.items())
+    print(f"  rates == PP rates reproduces old:   {wiring < 1e-12}")
     print(f"  totals chain margins == margin chain: {tot_gap < 1e-6}")

@@ -320,7 +320,12 @@ class GameSim:
         event = self._update_pull(p)
         lam_s, mu_s = p.lam / REG, p.mu / REG
         rh, ra = lam_s, mu_s
-        if self.pp_team == "home":
+        pp_pull = (m.pulled_pp_rates(p.endgame, self.pp_team).get(self.d)
+                   if self.pp_team and self.pulled and p.endgame is not None else None)
+        if pp_pull:                        # pulled during a PP: 6v4 / 5v5
+            w = p.endgame.window_seconds
+            rh, ra = pp_pull[0] / w, pp_pull[1] / w
+        elif self.pp_team == "home":
             rh, ra = lam_s * p.pp_mult * p.st_home, mu_s * p.sh_mult * p.st_away
         elif self.pp_team == "away":
             rh, ra = lam_s * p.sh_mult * p.st_home, mu_s * p.pp_mult * p.st_away
@@ -362,9 +367,8 @@ class GameSim:
         return event
 
     def _en(self, team: str, p: Params) -> bool:
-        """Goal into the empty net (leading team, goalie pulled, no PP)."""
-        return (not self.pp_team and self.pulled is not None
-                and self.pulled != team)
+        """Goal into the empty net (leading team, other goalie pulled)."""
+        return self.pulled is not None and self.pulled != team
 
     def _end_regulation(self, p: Params):
         self.elapsed = REG

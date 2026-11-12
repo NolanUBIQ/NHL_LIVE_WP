@@ -113,7 +113,7 @@ for g in load():
                 and typ not in ("period-end", "game-end")):
             pull_left = (prev[0] + left) / 2 if prev is not None and prev[1] is False else left
             active = dict(season=season, team=trailing, margin=margin, pull_left=pull_left,
-                          outcome="none", goal_left=None, en=False,
+                          pull_strength=strength, outcome="none", goal_left=None, en=False,
                           expo=defaultdict(float), goals=Counter())
         prev = (left, t_out if trailing else None)
     if active:
@@ -162,6 +162,26 @@ for margin in (1, 2):
         print(f"  down {margin}, {strength}: {T / 3600:5.1f} h   leading team (EN) {gl:4d} = "
               f"{gl / T * 150:.3f} ± {np.sqrt(gl) / T * 150:.3f}   trailing team {gt:4d} = "
               f"{gt / T * 150:.3f} ± {np.sqrt(gt) / T * 150:.3f}")
+
+# Pulled with a power play on (down 1 and 2 pooled; samples are small):
+#   6v4 = trailing team on the PP pulls; 5v5 = trailing team shorthanded pulls
+print("\nPulled with a PP on, down 1 + 2 pooled (goals per 150 s):")
+for strength, what in (("6v4", "trailing team on the PP"), ("5v5", "trailing team shorthanded")):
+    T = sum(expo[(mg, strength)] for mg in (1, 2))
+    gl = sum(goals[(mg, strength, "lead")] for mg in (1, 2))
+    gt = sum(goals[(mg, strength, "trail")] for mg in (1, 2))
+    print(f"  {strength} ({what}): {T / 3600:4.1f} h   leading team (EN) {gl:3d} = "
+          f"{gl / T * 150:.3f} ± {np.sqrt(gl) / T * 150:.3f}   trailing team {gt:3d} = "
+          f"{gt / T * 150:.3f} ± {np.sqrt(gt) / T * 150:.3f}")
+
+print("\nPull time by strength at the pull (seconds left):")
+for margin in (1, 2):
+    for strength in ("6v5", "6v4", "5v5"):
+        pl = np.array([e["pull_left"] for e in episodes
+                       if e["margin"] == margin and e["pull_strength"] == strength])
+        if len(pl) >= 5:
+            print(f"  down {margin}, {strength}: n={len(pl):4d}  median {np.median(pl):4.0f}  "
+                  f"mean {pl.mean():4.0f}  p25 {np.percentile(pl, 25):4.0f}  p75 {np.percentile(pl, 75):4.0f}")
 
 json.dump([{k: v for k, v in e.items() if k not in ("expo", "goals")} for e in episodes],
           open(os.path.join(HERE, "episodes.json"), "w"))
