@@ -30,7 +30,10 @@ Requires numpy, scipy and matplotlib (tkinter ships with Python).
 ## Connecting other feeds and outputs
 
 - **Feed:** any object with `poll() -> GameState` works; for push-style
-  providers, call `PushFeed.push(state)` from your callback.
+  providers, call `PushFeed.push(state)` from your callback. Set
+  `pp_seconds` to the advantage's whole time left and `pp_kind` to what a PP
+  goal would do: `minor` (ends it), `double` (first half of a double minor: a
+  fresh 2:00 starts) or `major` (runs on, also a 5-on-3 dropping to 5-on-4).
 - **Output:** any callable `sink(state, prices)` can be passed to `LiveRunner`;
   `prices.to_dict()` is JSON-ready.
 

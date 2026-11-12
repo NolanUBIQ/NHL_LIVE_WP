@@ -142,7 +142,8 @@ class GameState:
     away_goalie_pulled: bool = False
     pp_team: str | None = None # team with the man advantage
     pp_seconds: int = 0        # until the advantage ends (if no goals)
-    pp_kind: str = "minor"     # minor: a PP goal ends it; major: runs in full
+    pp_kind: str = "minor"     # minor: a PP goal ends it; double: a PP goal starts
+                               # a fresh 2:00 (double minor, first half); major: runs on
     pp_two_man_seconds: int = 0  # part of pp_seconds at a two-man advantage
     pp_estimated: bool = False # PP seen in situationCode but not rebuilt from events
     winner: str | None = None
@@ -183,7 +184,7 @@ class GameState:
             sk = (f"{self.home_skaters}v{self.away_skaters}" if self.pp_team == "home"
                   else f"{self.away_skaters}v{self.home_skaters}")
             est = "~" if self.pp_estimated else ""
-            kind = " major" if self.pp_kind == "major" else ""
+            kind = {"major": " major", "double": " double"}.get(self.pp_kind, "")
             return f"{self.team(self.pp_team)} PP{kind} {est}{fmt_clock(self.pp_seconds)} ({sk})"
         pulled = [self.team(s) for s, f in (("home", self.home_goalie_pulled),
                                             ("away", self.away_goalie_pulled)) if f]
@@ -287,15 +288,40 @@ class PenaltyBox:
             self._remove(p, t)
 
     def project(self, t: int) -> tuple[str | None, int, int, str]:
-        """(pp_team, seconds left, two-man seconds, kind) if nothing else happens."""
+        """
+        (pp_team, seconds left, two-man seconds, kind) if nothing else happens.
+
+        kind says what a PP goal now would do to the advantage (see
+        nhl_ingame_skellam.PENALTIES): "minor" it ends, "double" it starts a
+        fresh 2:00 (first half of a double minor), "major" it runs on as
+        before (e.g. a 5-on-3 dropping to 5-on-4). Other mixes, such as a
+        major ending before a minor, take whichever of minor / major is closer.
+        """
+        team, left, two = self._advantage(t)
+        if team is None:
+            return None, 0, 0, "minor"
+        after = copy.deepcopy(self)
+        after.goal(t, team)
+        a_team, a_left, _ = after._advantage(t)
+        r = a_left if a_team == team else 0
+        if r == 0:
+            kind = "minor"
+        elif r >= left:
+            kind = "major"
+        elif left > 120 and r == 120:
+            kind = "double"
+        else:
+            kind = "major" if 2 * r >= left else "minor"
+        return team, left, two, kind
+
+    def _advantage(self, t: int) -> tuple[str | None, int, int]:
+        """(pp_team, seconds left, two-man seconds) if nothing else happens."""
         box = copy.deepcopy(self)
         box.expire(t)
         nh, na = box.counts()
         if nh == na:
-            return None, 0, 0, "minor"
+            return None, 0, 0
         team = "home" if na > nh else "away"
-        sh = "away" if team == "home" else "home"
-        kind = "major" if all(p.kind == "major" for p in box.active[sh]) else "minor"
         now, two = t, 0
         while True:
             nh, na = box.counts()
@@ -307,7 +333,7 @@ class PenaltyBox:
                 two += nxt - now
             box.expire(nxt)
             now = nxt
-        return team, now - t, two, kind
+        return team, now - t, two
 
 
 def _skaters(nh: int, na: int, period_type: str) -> tuple[int, int]:

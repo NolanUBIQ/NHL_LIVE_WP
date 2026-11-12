@@ -115,6 +115,9 @@ def in_game_probs(lam: float, mu: float, t: float, d: int,
 #   Shorthanded goals don't end the PP, so they just accumulate.
 # Major penalty: the PP runs its full length regardless of goals, so the PP
 #   window is just another Skellam, convolved with ordinary play.
+# Double minor: as a minor over the first half, except that a PP goal there
+#   starts a fresh 2:00 minor instead of ending the PP. pp_seconds is the
+#   whole double's time left and may run past the end of regulation.
 #
 # Default multipliers are rough league-level figures relative to a team's
 # ALL-SITUATIONS goal rate (5v4 GF/60 ~ 2.3x, 4v5 GF/60 ~ 0.27x). Fit them
@@ -122,7 +125,17 @@ def in_game_probs(lam: float, mu: float, t: float, d: int,
 
 K_GRID = 25
 GRID = np.arange(-K_GRID, K_GRID + 1)
+SUPPORT = np.arange(-2 * K_GRID, 2 * K_GRID + 1)   # remaining_diff_dist's output
 _EPS = 1e-12
+
+# Penalty kinds, by what a power-play goal does to the advantage:
+#   minor  : ends it
+#   double : double minor; a PP goal in the first half ends only the first
+#            minor and the second starts at once with a full 2:00 (pp_seconds
+#            <= DOUBLE_HALF is the second half, i.e. an ordinary minor)
+#   major  : nothing, it runs in full
+PENALTIES = ("minor", "double", "major")
+DOUBLE_HALF = 120.0
 
 
 def _skellam_grid(lam_t: float, mu_t: float) -> np.ndarray:
@@ -172,7 +185,12 @@ def remaining_diff_dist(lam: float, mu: float, t: float,
     # a = PP team's rate, b = SH team's rate (goals/second).
     # A PP goal moves the home diff by +sign, a SH goal by -sign.
 
-    support = np.arange(-2 * K_GRID, 2 * K_GRID + 1)
+    support = SUPPORT.copy()
+
+    if penalty == "double" and pp_seconds <= DOUBLE_HALF:
+        penalty = "minor"                  # second half: an ordinary minor
+    if penalty not in PENALTIES:
+        raise ValueError(f"penalty must be one of {PENALTIES}")
 
     if penalty == "major":
         pp_dist = (_skellam_grid(a * s, b * s) if sign == 1
@@ -180,10 +198,67 @@ def remaining_diff_dist(lam: float, mu: float, t: float,
         es_dist = _skellam_grid(lam_s * (T - s), mu_s * (T - s))
         return support, np.convolve(pp_dist, es_dist)
 
-    if penalty != "minor":
-        raise ValueError("penalty must be 'minor' or 'major'")
+    if penalty == "minor":
+        return support, _pp_window(
+            a, b, sign, s, dt,
+            lambda u: _skellam_grid(lam_s * (T - u), mu_s * (T - u)),
+            _skellam_grid(lam_s * (T - s), mu_s * (T - s)))
 
-    final = np.zeros(len(support))
+    # Double minor, first half still running. A PP goal ends only the first
+    # minor; the second starts at once with a full 2:00 (a fresh minor). If
+    # the first half runs out, the second minor follows at its full 2:00.
+    w = min(pp_seconds - DOUBLE_HALF, T)   # first-half time left in regulation
+    minor = dict(pp_team=pp_team, pp_seconds=DOUBLE_HALF, penalty="minor",
+                 pp_mult=pp_mult, sh_mult=sh_mult, dt=dt,
+                 st_home=st_home, st_away=st_away)
+    # a fresh 2:00 minor with `left` s of regulation to go = (the minor over
+    # its own 2:00) + (even strength after), since Skellams add
+    m120 = remaining_diff_dist(lam, mu, DOUBLE_HALF / REG_SECONDS, **minor)[1]
+    short: dict[float, np.ndarray] = {}
+
+    def after_ppg(u: float) -> np.ndarray:
+        left = T - u
+        if left >= DOUBLE_HALF:
+            es = left - DOUBLE_HALF
+            return np.convolve(m120, _skellam_grid(lam_s * es, mu_s * es))
+        key = round(left, 6)
+        if key not in short:
+            short[key] = remaining_diff_dist(lam, mu, left / REG_SECONDS, **minor)[1]
+        return short[key]
+
+    after_first = (remaining_diff_dist(lam, mu, (T - w) / REG_SECONDS, **minor)[1]
+                   if T - w > 0 else _point_mass(0))
+    return support, _pp_window(a, b, sign, w, dt, after_ppg, after_first)
+
+
+def _fit(v: np.ndarray, n: int) -> np.ndarray:
+    """Centre-crop or zero-pad an odd-length pmf (centred on 0) to length n."""
+    if len(v) == n:
+        return v
+    if len(v) > n:
+        c = (len(v) - n) // 2
+        return v[c:c + n]
+    out = np.zeros(n)
+    c = (n - len(v)) // 2
+    out[c:c + len(v)] = v
+    return out
+
+
+def _pp_window(a: float, b: float, sign: int, s: float, dt: float,
+               after_ppg, after_window: np.ndarray) -> np.ndarray:
+    """
+    Remaining home-diff distribution (on SUPPORT) through a PP window of s
+    seconds that a PP goal ends, stepped every dt.
+
+    a, b         : PP / SH team scoring rates (goals per second)
+    sign         : +1 if home has the PP, -1 if away
+    after_ppg(u) : diff distribution for the rest of regulation after a PP
+                   goal u seconds into the window (odd length, centred on 0)
+    after_window : same, for the window running out without a PP goal
+    Shorthanded goals don't end the PP, so they just accumulate.
+    """
+    n_out = len(SUPPORT)
+    final = np.zeros(n_out)
     q = np.zeros(K_GRID + 1)      # q[k]: PP still on, SH team has scored k
     q[0] = 1.0
     ks = np.arange(K_GRID + 1)
@@ -200,8 +275,8 @@ def remaining_diff_dist(lam: float, mu: float, t: float,
             pp_dist = np.zeros(len(GRID))
             for k in ks[end_mass > 0]:
                 pp_dist += end_mass[k] * _point_mass(sign * (1 - k))
-            left = T - (j + 0.5) * h       # goal assumed mid-step
-            final += np.convolve(pp_dist, _skellam_grid(lam_s * left, mu_s * left))
+            # goal assumed mid-step
+            final += _fit(np.convolve(pp_dist, after_ppg((j + 0.5) * h)), n_out)
 
         # PP continues: possibly a SH goal
         stay = q * (1.0 - p_pp)
@@ -212,9 +287,8 @@ def remaining_diff_dist(lam: float, mu: float, t: float,
     pp_dist = np.zeros(len(GRID))
     for k in ks[q > 0]:
         pp_dist += q[k] * _point_mass(-sign * k)
-    final += np.convolve(pp_dist, _skellam_grid(lam_s * (T - s), mu_s * (T - s)))
-
-    return support, final
+    final += _fit(np.convolve(pp_dist, after_window), n_out)
+    return final
 
 
 def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
@@ -450,6 +524,62 @@ def _goalie_moves(P: np.ndarray, s: float, h: float, masks, tau1: float, tau2: f
     P[2][:, other] = 0.0
 
 
+def _route_goals(P2: np.ndarray, G_h: np.ndarray, G_a: np.ndarray,
+                 pp_team: str | None, penalty: str, reset: int | None) -> None:
+    """
+    Add one chain step's goals to P2 = P[2] (goalie back in for the faceoff),
+    in place. G_h / G_a: home / away goal mass, already moved to the new
+    score, over (PP state, ...). PP states: 0 = none, 1 = the PP in progress,
+    2.. = a double minor's fresh second minor, by steps left. A PP goal ends
+    a minor (state 0) or, with `reset` set (first half of a double minor),
+    starts the fresh minor at index `reset`; a major and shorthanded goals
+    leave the PP as it is.
+    """
+    if pp_team is None:
+        P2 += G_h + G_a
+        return
+    G_pp, G_sh = (G_h, G_a) if pp_team == "home" else (G_a, G_h)
+    P2 += G_sh
+    if penalty == "major":
+        P2 += G_pp
+    elif reset is None:
+        P2[0] += G_pp.sum(axis=0)
+    else:
+        P2[0] += G_pp[0] + G_pp[2:].sum(axis=0)
+        P2[reset] += G_pp[1]
+
+
+def _tick_reset(P: np.ndarray) -> None:
+    """Count the fresh-minor clock (PP states 2..) down one step, in place."""
+    P[:, 0] += P[:, 2]
+    P[:, 2:-1] = P[:, 3:].copy()
+    P[:, -1] = 0.0
+
+
+def _chain_setup(T: float, eg: EndgameParams, d: int, pulled: bool, pull_at,
+                 pp_team, pp_seconds: float, penalty: str):
+    """Shared start of the two pull-time chains."""
+    if penalty not in PENALTIES:
+        raise ValueError(f"penalty must be one of {PENALTIES}")
+    tau1, tau2 = pull_at if pull_at is not None else (
+        assumed_pull_time(T, eg, 1), assumed_pull_time(T, eg, 2))
+    sfx = _sfx_on(eg)
+    tau = max(tau1, tau2, eg.sfx_seconds if sfx else 0.0)
+    pulled = pulled and abs(d) in (1, 2)
+    pp_on = pp_team is not None and pp_seconds > 0
+    pp_end = T - pp_seconds if pp_on else -1.0     # seconds left when PP expires
+    # Chain from now if the goalie is out or the PP runs into the endgame,
+    # otherwise from the earliest assumed pull time (or score-effects start).
+    S0 = T if (pulled or (pp_on and pp_end < min(T, tau))) else min(T, tau)
+    n = max(int(np.ceil(S0 - 1e-9)), 1)
+    h = S0 / n if S0 > 0 else 1.0
+    # a double minor still in its first half when the chain starts: clock its
+    # possible fresh second minor in steps (PP states 2 .. n_reset + 1)
+    n_reset = (int(round(DOUBLE_HALF / h)) if pp_on and S0 >= T and penalty == "double"
+               and pp_seconds > DOUBLE_HALF else 0)
+    return tau1, tau2, sfx, pulled, pp_on, pp_end, S0, n, h, n_reset
+
+
 def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
                         eg: EndgameParams, pulled: bool = False,
                         pull_at: float | None = None,
@@ -465,26 +595,20 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
     pulled  : the trailing team's goalie is out right now (used at d = +/-1, +/-2)
     pull_at : (down 1, down 2) seconds left at which a not-yet-pulled goalie
               comes out (default assumed_pull_time(T, eg, margin))
+    penalty : "minor" / "double" / "major" (see PENALTIES); pp_seconds is the
+              PP's whole time left and may run past the end of regulation
     Other arguments as in remaining_diff_dist.
     """
     T = max(t, 0.0) * REG_SECONDS
     if T <= 0:
         return {d: 1.0}
-    tau1, tau2 = pull_at if pull_at is not None else (
-        assumed_pull_time(T, eg, 1), assumed_pull_time(T, eg, 2))
-    sfx = _sfx_on(eg)
-    tau = max(tau1, tau2, eg.sfx_seconds if sfx else 0.0)
-    pulled = pulled and abs(d) in (1, 2)
-    pp_on = pp_team is not None and pp_seconds > 0
-    pp_end = T - pp_seconds if pp_on else -1.0     # seconds left when PP expires
-
-    # Chain from now if the goalie is out or the PP runs into the endgame,
-    # otherwise from the earliest assumed pull time (or score-effects start).
-    S0 = T if (pulled or (pp_on and pp_end < min(T, tau))) else min(T, tau)
+    tau1, tau2, sfx, pulled, pp_on, pp_end, S0, n, h, n_reset = _chain_setup(
+        T, eg, d, pulled, pull_at, pp_team, pp_seconds, penalty)
 
     n_m = 2 * _EG_PAD + 1
     margins = np.arange(d - _EG_PAD, d + _EG_PAD + 1)
-    P = np.zeros((3, 2, n_m))             # [goalie state, pp on, margin]
+    n_pp = 2 + n_reset
+    P = np.zeros((3, n_pp, n_m))          # [goalie state, PP state, margin]
     if S0 < T:
         kw = dict(pp_team=pp_team, pp_seconds=pp_seconds, penalty=penalty,
                   pp_mult=pp_mult, sh_mult=sh_mult, dt=dt,
@@ -499,24 +623,19 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
 
     lam_s, mu_s = lam / REG_SECONDS, mu / REG_SECONDS
     W = eg.window_seconds
-    # rates[goalie state, pp] -> (home, away) per margin
-    rh = np.full((3, 2, n_m), lam_s)
-    ra = np.full((3, 2, n_m), mu_s)
+    # rates[goalie state, PP state] -> (home, away) per margin
+    rh = np.full((3, n_pp, n_m), lam_s)
+    ra = np.full((3, n_pp, n_m), mu_s)
     up1, dn1 = margins == 1, margins == -1
     up2, dn2 = margins == 2, margins == -2
     if pp_on:
         if pp_team == "home":
-            rh[:, 1], ra[:, 1] = lam_s * pp_mult * st_home, mu_s * sh_mult * st_away
+            rh[:, 1:], ra[:, 1:] = lam_s * pp_mult * st_home, mu_s * sh_mult * st_away
         else:
-            rh[:, 1], ra[:, 1] = lam_s * sh_mult * st_home, mu_s * pp_mult * st_away
-    # a PP goal ends a minor
-    home_ends_pp = pp_on and pp_team == "home" and penalty == "minor"
-    away_ends_pp = pp_on and pp_team == "away" and penalty == "minor"
+            rh[:, 1:], ra[:, 1:] = lam_s * sh_mult * st_home, mu_s * pp_mult * st_away
     one, two = up1 | dn1, up2 | dn2
     masks = (one, two, ~(one | two))
 
-    n = max(int(np.ceil(S0 - 1e-9)), 1)
-    h = S0 / n
     steps = {}                            # (ph, pa) by (score-effects window, final stretch)
     for in_fx in (False, True):
         for final in (False, True):
@@ -530,19 +649,27 @@ def endgame_margin_dist(lam: float, mu: float, t: float, d: int,
             steps[in_fx, final] = _step_probs(rh_f, ra_f, h)
     for j in range(n):
         s = S0 - j * h                    # seconds left at the start of this step
+        if pp_on and s <= pp_end + 1e-9:  # PP expires (a fresh minor ends before it)
+            P[:, 0] += P[:, 1:].sum(axis=1)
+            P[:, 1:] = 0.0
+            if n_reset:                   # drop the fresh-minor clock
+                P = P[:, :2].copy()
+                steps = {k: (a[:, :2], b[:, :2]) for k, (a, b) in steps.items()}
+                n_reset = 0
         ph, pa = steps[s <= eg.sfx_seconds + 1e-9, s <= eg.final_seconds + 1e-9]
-        if pp_on and s <= pp_end + 1e-9:  # PP expires
-            P[:, 0] += P[:, 1]
-            P[:, 1] = 0.0
         _goalie_moves(P, s, h, masks, tau1, tau2, eg)
         home_g, away_g = P * ph, P * pa
         P = P - home_g - away_g
         # any goal ends the pull (goalie back in for the faceoff); shift margins
-        for pp in (0, 1):
-            to_h = 0 if (pp == 1 and home_ends_pp) else pp
-            to_a = 0 if (pp == 1 and away_ends_pp) else pp
-            P[2, to_h, 1:] += home_g[:, pp, :-1].sum(axis=0)
-            P[2, to_a, :-1] += away_g[:, pp, 1:].sum(axis=0)
+        G_h = np.zeros_like(P[2])
+        G_a = np.zeros_like(P[2])
+        G_h[:, 1:] = home_g[:, :, :-1].sum(axis=0)
+        G_a[:, :-1] = away_g[:, :, 1:].sum(axis=0)
+        reset = (n_reset + 1 if n_reset and s - 0.5 * h - pp_end > DOUBLE_HALF
+                 else None)               # goal assumed mid-step
+        _route_goals(P[2], G_h, G_a, pp_team if pp_on else None, penalty, reset)
+        if n_reset:
+            _tick_reset(P)
 
     final = P.sum(axis=(0, 1))
     return {int(k): float(v) for k, v in zip(margins, final) if v > 0}
@@ -563,7 +690,8 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
     Same endgame chain as endgame_margin_dist, but over each team's goals so
     empty-net and extra-attacker goals land in the total. Before the endgame
     the two teams' goals are independent Poissons, with a power play counted
-    at its expected length (a minor ends on a PP goal), so the implied margin
+    at its expected length (a minor ends on a PP goal, a double minor's
+    first-half PP goal starts a fresh 2:00), so the implied margin
     distribution differs very slightly from endgame_margin_dist's exact one.
     """
     G = max_goals
@@ -573,14 +701,8 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
         out = np.zeros((G + 1, G + 1))
         out[0, 0] = 1.0
         return out
-    tau1, tau2 = pull_at if pull_at is not None else (
-        assumed_pull_time(T, eg, 1), assumed_pull_time(T, eg, 2))
-    sfx = _sfx_on(eg)
-    tau = max(tau1, tau2, eg.sfx_seconds if sfx else 0.0)
-    pulled = pulled and abs(d) in (1, 2)
-    pp_on = pp_team is not None and pp_seconds > 0
-    pp_end = T - pp_seconds if pp_on else -1.0
-    S0 = T if (pulled or (pp_on and pp_end < min(T, tau))) else min(T, tau)
+    tau1, tau2, sfx, pulled, pp_on, pp_end, S0, n, h, n_reset = _chain_setup(
+        T, eg, d, pulled, pull_at, pp_team, pp_seconds, penalty)
 
     lam_s, mu_s = lam / REG_SECONDS, mu / REG_SECONDS
     if pp_team == "home":
@@ -588,15 +710,22 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
     else:
         pp_h, pp_a = lam_s * sh_mult * st_home, mu_s * pp_mult * st_away
 
-    P = np.zeros((3, 2, G + 1, G + 1))   # [goalie state, pp on, home goals, away goals]
+    n_pp = 2 + n_reset
+    P = np.zeros((3, n_pp, G + 1, G + 1))   # [goalie state, PP state, home goals, away goals]
     if S0 < T:
         L = T - S0                       # pre-endgame stretch; any PP ends inside it
         h_mean, a_mean = lam_s * L, mu_s * L
         if pp_on:
             s = min(pp_seconds, L)
             a_rate = pp_h if pp_team == "home" else pp_a          # PP team's rate
-            s_eff = (s if penalty == "major" or a_rate <= 0
-                     else (1 - np.exp(-a_rate * s)) / a_rate)
+            if penalty == "major" or a_rate <= 0:
+                s_eff = s
+            elif penalty == "double" and s > DOUBLE_HALF:
+                # first half to the first PP goal (or its end), then a fresh minor
+                s_eff = ((1 - np.exp(-a_rate * (s - DOUBLE_HALF)))
+                         + (1 - np.exp(-a_rate * DOUBLE_HALF))) / a_rate
+            else:
+                s_eff = (1 - np.exp(-a_rate * s)) / a_rate
             h_mean = pp_h * s_eff + lam_s * (L - s_eff)
             a_mean = pp_a * s_eff + mu_s * (L - s_eff)
         P0 = np.outer(poisson.pmf(k, h_mean), poisson.pmf(k, a_mean))
@@ -608,17 +737,13 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
 
     W = eg.window_seconds
     M = d + k[:, None] - k[None, :]      # margin in each cell
-    rh = np.full((3, 2, G + 1, G + 1), lam_s)
-    ra = np.full((3, 2, G + 1, G + 1), mu_s)
+    rh = np.full((3, n_pp, G + 1, G + 1), lam_s)
+    ra = np.full((3, n_pp, G + 1, G + 1), mu_s)
     if pp_on:
-        rh[:, 1], ra[:, 1] = pp_h, pp_a
-    home_ends_pp = pp_on and pp_team == "home" and penalty == "minor"
-    away_ends_pp = pp_on and pp_team == "away" and penalty == "minor"
+        rh[:, 1:], ra[:, 1:] = pp_h, pp_a
     one, two = np.abs(M) == 1, np.abs(M) == 2
     masks = (one, two, ~(one | two))
 
-    n = max(int(np.ceil(S0 - 1e-9)), 1)
-    h = S0 / n
     steps = {}
     for in_fx in (False, True):
         for final in (False, True):
@@ -635,18 +760,26 @@ def endgame_goals_dist(lam: float, mu: float, t: float, d: int,
             steps[in_fx, final] = _step_probs(rh_f, ra_f, h)
     for j in range(n):
         s = S0 - j * h
-        ph, pa = steps[s <= eg.sfx_seconds + 1e-9, s <= eg.final_seconds + 1e-9]
         if pp_on and s <= pp_end + 1e-9:
-            P[:, 0] += P[:, 1]
-            P[:, 1] = 0.0
+            P[:, 0] += P[:, 1:].sum(axis=1)
+            P[:, 1:] = 0.0
+            if n_reset:
+                P = P[:, :2].copy()
+                steps = {k_: (a[:, :2], b[:, :2]) for k_, (a, b) in steps.items()}
+                n_reset = 0
+        ph, pa = steps[s <= eg.sfx_seconds + 1e-9, s <= eg.final_seconds + 1e-9]
         _goalie_moves(P, s, h, masks, tau1, tau2, eg)
         home_g, away_g = P * ph, P * pa
         P = P - home_g - away_g
-        for pp in (0, 1):
-            to_h = 0 if (pp == 1 and home_ends_pp) else pp
-            to_a = 0 if (pp == 1 and away_ends_pp) else pp
-            P[2, to_h, 1:, :] += home_g[:, pp, :-1, :].sum(axis=0)
-            P[2, to_a, :, 1:] += away_g[:, pp, :, :-1].sum(axis=0)
+        G_h = np.zeros_like(P[2])
+        G_a = np.zeros_like(P[2])
+        G_h[:, 1:, :] = home_g[:, :, :-1, :].sum(axis=0)
+        G_a[:, :, 1:] = away_g[:, :, :, :-1].sum(axis=0)
+        reset = (n_reset + 1 if n_reset and s - 0.5 * h - pp_end > DOUBLE_HALF
+                 else None)
+        _route_goals(P[2], G_h, G_a, pp_team if pp_on else None, penalty, reset)
+        if n_reset:
+            _tick_reset(P)
     return P.sum(axis=(0, 1))
 
 
@@ -989,3 +1122,43 @@ if __name__ == "__main__":
         for k, v in mg.items():
             gap = max(gap, abs(J[hh - aa + dd == k].sum() - v))
     print(f"  totals chain margins == margin chain: {gap < 1e-6}")
+
+    # --- Double minors ---------------------------------------------------
+    print("\nDouble minor (tied, start of 2nd, home PP win-equiv):")
+    pp_we = {}
+    for kind, secs in (("minor", 120), ("double", 240), ("major", 240)):
+        pp_we[kind] = in_game_probs_pp(lam, mu, t2, 0, "home", secs, kind).win_equiv
+        print(f"  {kind:<7} {secs}s: {pp_we[kind]:.4f}")
+
+    def _gap(a, b):
+        return max(abs(a.get(k, 0) - b.get(k, 0)) for k in set(a) | set(b))
+
+    second_half = all(_gap(f(penalty="double"), f(penalty="minor")) < 1e-12 for f in (
+        lambda **kw: regulation_margin_dist(lam, mu, 0.5, 0, pp_team="away", pp_seconds=100, **kw),
+        lambda **kw: endgame_margin_dist(lam, mu, 0.05, 1, eg, pp_team="home",
+                                         pp_seconds=100, **kw)))
+    neutral_dbl = _gap(regulation_margin_dist(lam, mu, 0.5, 1),
+                       regulation_margin_dist(lam, mu, 0.5, 1, pp_team="home", pp_seconds=240,
+                                              penalty="double", pp_mult=1.0, sh_mult=1.0))
+    # with pulled / score-effect rates equal to the base rates, the chain must
+    # reproduce the Skellam double minor
+    r150 = 3.0 * 150 / REG_SECONDS
+    flat = EndgameParams(r150, r150, r150, r150, e2_lead=r150, e2_trail=r150,
+                         final_lead=r150, final_trail=r150, sfx_seconds=0)
+    chain_gap = max(_gap(
+        endgame_margin_dist(3.0, 3.0, T / REG_SECONDS, dd, flat, pull_at=(T, T),
+                            pp_team=team, pp_seconds=secs, penalty="double"),
+        regulation_margin_dist(3.0, 3.0, T / REG_SECONDS, dd, pp_team=team,
+                               pp_seconds=secs, penalty="double"))
+        for T, dd, secs, team in ((1100, 0, 240, "home"), (180, -1, 230, "away")))
+    J = endgame_goals_dist(lam, mu, 0.2, 1, eg, pp_team="away", pp_seconds=200,
+                           penalty="double", max_goals=20)
+    hh, aa = np.indices(J.shape)
+    mg = endgame_margin_dist(lam, mu, 0.2, 1, eg, pp_team="away", pp_seconds=200,
+                             penalty="double")
+    tot_gap = max(abs(J[hh - aa + 1 == k].sum() - v) for k, v in mg.items())
+    print(f"  minor < double < major:             {pp_we['minor'] < pp_we['double'] < pp_we['major']}")
+    print(f"  second half (<= 2:00) == minor:     {second_half}")
+    print(f"  multipliers=1 matches base:         {neutral_dbl < 1e-4}  ({neutral_dbl:.1e})")
+    print(f"  chain == Skellam at base rates:     {chain_gap < 1e-3}  ({chain_gap:.1e})")
+    print(f"  totals chain margins == margin chain: {tot_gap < 1e-6}")

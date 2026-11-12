@@ -21,6 +21,9 @@ Game situations:
     each time that passes), re-pulls ~25 s after a goal, and the feed's
     goalie-out flag switches to the pulled state as soon as it happens;
     3rd-period score effects raise the trailing team's rate down 1 / 2
+  - PP kind (from the feed): a PP goal ends a minor, starts a fresh 2:00 in
+    a double minor's first half, and leaves a major (or a 5-on-3 dropping
+    to 5-on-4) running
   - 5-on-3: the PP multiplier is the time-weighted mix of pp53_mult (two-man
     portion) and pp_mult over the whole advantage
   - OT / shootout: the game is tied, so home wins with p_ot
@@ -221,14 +224,18 @@ class LivePricer:
 
     # -- model pieces ---------------------------------------------------------
     def _pp(self, st: GameState, T: float):
-        """(pp_team, seconds, kind, effective PP mult) or None."""
+        """
+        (pp_team, seconds, kind, effective PP mult) or None. seconds is the
+        PP's whole time left (the model cuts it at the horn itself; a double
+        minor needs it uncut to know where its first half ends).
+        """
         if not st.pp_team or st.pp_seconds <= 0 or T <= 0:
             return None
         c = self.cfg
         s = min(st.pp_seconds, T)
         two = min(st.pp_two_man_seconds, s)
         mult = (two * c.pp53_mult + (s - two) * c.pp_mult) / s
-        return st.pp_team, s, st.pp_kind, mult
+        return st.pp_team, st.pp_seconds, st.pp_kind, mult
 
     def pulled(self, st: GameState) -> bool:
         """The trailing team (down 1 or 2) has its goalie out late in regulation."""

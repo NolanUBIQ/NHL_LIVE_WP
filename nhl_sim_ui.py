@@ -89,6 +89,7 @@ class Params:
     sim_pull_sd: float = 40.0
     sim_pull2_mean: float = 200.0  # simulated pull time down 2
     sim_pull2_sd: float = 70.0
+    double_pct: float = 0.0        # share of penalties that are double minors (0-1)
 
 
 # (key, label, default) grouped by section
@@ -104,7 +105,8 @@ SECTIONS = [
         ("pp_mult", "PP rate mult", "2.30"),
         ("sh_mult", "SH rate mult", "0.27"),
         ("pen_rate", "Penalties / team / 60", "3.0"),
-        ("major_pct", "Major penalty %", "3"),
+        ("major_pct", "Major / double-minor %", "3"),
+        ("double_pct", None, "3"),
         ("dt", "Model PP step (s)", "1.0"),
     ]),
     ("Pregame special teams", [
@@ -284,7 +286,9 @@ class GameSim:
         if self.pp_team:
             if team == self.pp_team:
                 tag = tag or "PPG"
-                if self.pp_kind == "minor":
+                if self.pp_kind == "double" and self.pp_left > 120:
+                    self.pp_left, self.pp_kind = 120, "minor"   # second minor starts now
+                elif self.pp_kind != "major":
                     self.pp_team, self.pp_left = None, 0
             else:
                 tag = tag or "SHG"
@@ -299,7 +303,7 @@ class GameSim:
         """`on_team` is the team that gets the power play."""
         self.pp_team = on_team
         self.pp_kind = kind
-        self.pp_left = 300 if kind == "major" else 120
+        self.pp_left = {"major": 300, "double": 240}.get(kind, 120)
         offender = "away" if on_team == "home" else "home"
         self.log.append(f"{short_clock(self.elapsed)}  {offender.upper()} {kind} "
                         f"-> {on_team.upper()} PP")
@@ -341,10 +345,11 @@ class GameSim:
             elif kind == 1:
                 self.goal("away", "EN" if self._en("away", p) else "")
             else:
-                major = self.rng.random() < p.major_pct
+                u = self.rng.random()
+                pen = ("major" if u < p.major_pct else
+                       "double" if u < p.major_pct + p.double_pct else "minor")
                 # kind 2: away takes a penalty -> home PP; kind 3: the reverse
-                self.penalty("home" if kind == 2 else "away",
-                             "major" if major else "minor")
+                self.penalty("home" if kind == 2 else "away", pen)
 
         self.elapsed += 1
         if self.pp_team:
@@ -629,16 +634,24 @@ class App(tk.Tk):
 
         man = tk.Frame(f, bg=PANEL)
         man.grid(row=5, column=0, sticky="ew", pady=(6, 0))
-        tk.Label(man, text="Inject:", bg=PANEL, fg=MUTED).pack(side="left", padx=(0, 6))
-        for text, cmd in [("Home goal", lambda: self.inject_goal("home")),
-                          ("Away goal", lambda: self.inject_goal("away")),
-                          ("Home PP", lambda: self.inject_pp("home", "minor")),
-                          ("Away PP", lambda: self.inject_pp("away", "minor")),
-                          ("Home 5-min PP", lambda: self.inject_pp("home", "major")),
-                          ("Away 5-min PP", lambda: self.inject_pp("away", "major")),
-                          ("End PP", self.inject_clear_pp),
-                          ("Pull goalie", self.inject_pull)]:
-            ttk.Button(man, text=text, command=cmd).pack(side="left", padx=2)
+        rows = [tk.Frame(man, bg=PANEL), tk.Frame(man, bg=PANEL)]
+        rows[0].pack(side="top", anchor="w")
+        rows[1].pack(side="top", anchor="w", pady=(3, 0))
+        tk.Label(rows[0], text="Inject:", bg=PANEL, fg=MUTED, width=7,
+                 anchor="w").pack(side="left")
+        tk.Label(rows[1], text="", bg=PANEL, width=7).pack(side="left")
+        for row, text, cmd in [
+                (0, "Home goal", lambda: self.inject_goal("home")),
+                (0, "Away goal", lambda: self.inject_goal("away")),
+                (0, "End PP", self.inject_clear_pp),
+                (0, "Pull goalie", self.inject_pull),
+                (1, "Home PP", lambda: self.inject_pp("home", "minor")),
+                (1, "Away PP", lambda: self.inject_pp("away", "minor")),
+                (1, "Home 4-min", lambda: self.inject_pp("home", "double")),
+                (1, "Away 4-min", lambda: self.inject_pp("away", "double")),
+                (1, "Home 5-min", lambda: self.inject_pp("home", "major")),
+                (1, "Away 5-min", lambda: self.inject_pp("away", "major"))]:
+            ttk.Button(rows[row], text=text, command=cmd).pack(side="left", padx=2)
 
     def _build_right(self, f):
         f.rowconfigure(3, weight=1)
@@ -698,7 +711,8 @@ class App(tk.Tk):
                       vals["pen_rate"], min(vals["major_pct"] / 100, 1.0),
                       vals["dt"], eg, st_home, st_away,
                       vals["sim_pull_mean"], vals["sim_pull_sd"],
-                      vals["sim_pull2_mean"], vals["sim_pull2_sd"])
+                      vals["sim_pull2_mean"], vals["sim_pull2_sd"],
+                      double_pct=min(vals["double_pct"] / 100, 1.0))
 
     def st_multipliers(self, vals) -> tuple[float, float]:
         """
@@ -783,11 +797,13 @@ class App(tk.Tk):
         elapsed, d, pp_team, pp_left, pp_kind, _ = self.sim.state()
         out = []
         for team, dd in (("home", 1), ("away", -1)):
-            team_pp, left = pp_team, pp_left
-            if pp_team == team and pp_kind == "minor":
+            team_pp, left, kind = pp_team, pp_left, pp_kind
+            if pp_team == team and pp_kind == "double" and pp_left > 120:
+                left, kind = 120, "minor"
+            elif pp_team == team and pp_kind != "major":
                 team_pp, left = None, 0
             # a goal ends any pull
-            we = self.evaluate(p, (elapsed, d + dd, team_pp, left, pp_kind, False))[0].win_equiv
+            we = self.evaluate(p, (elapsed, d + dd, team_pp, left, kind, False))[0].win_equiv
             out.append(we - base_we)
         return out
 
