@@ -72,20 +72,23 @@ def pr_win_by(k, lam_t: float, mu_t: float):
 
 def in_game_probs(lam: float, mu: float, t: float, d: int,
                   p_ot: float | None = None,
-                  endgame: "EndgameParams | None" = None) -> InGameProbs:
+                  endgame: "EndgameParams | None" = None,
+                  pulled: bool = False) -> InGameProbs:
     """
     lam, mu : full-game expected goals for home and away
     t       : fraction of regulation REMAINING (1.0 = puck drop, 0.0 = end of 3rd)
     d       : current goal differential, home - away
     p_ot    : home win prob if tied after regulation (default lam/(lam+mu))
-    endgame : optional EndgameParams for the pulled-goalie adjustment
+    endgame : optional EndgameParams -> pull-time endgame model (as the live
+              pricer); None = plain Skellam
+    pulled  : the trailing team's goalie is out now (endgame model only)
     """
     if p_ot is None:
         p_ot = lam / (lam + mu)
 
     if endgame is not None:
         return _outcomes_from_margins(
-            regulation_margin_dist(lam, mu, t, d, endgame=endgame), p_ot)
+            regulation_margin_dist(lam, mu, t, d, endgame=endgame, pulled=pulled), p_ot)
 
     lam_t, mu_t = lam * max(t, 0.0), mu * max(t, 0.0)
 
@@ -300,8 +303,13 @@ def _outcomes_from_dist(dist: np.ndarray, support: np.ndarray, d: int,
 
 
 # ---------------------------------------------------------------------------
-# Endgame (pulled goalie) adjustment
+# Legacy endgame overlay (NOT used for pricing)
 # ---------------------------------------------------------------------------
+# The original closed-form endgame adjustment, kept for reference. Pricing
+# (live pricer, simulator and endgame= everywhere in this module) uses the
+# pull-time model below (endgame_margin_dist). Use overlay_margin_dist /
+# in_game_probs_overlay only to reproduce the old numbers.
+#
 # Notation map to the source formula (home = mu, away = nu there):
 #   source mu, nu         -> lam, mu here (full-game expected goals)
 #   source mu^EL, nu^EL   -> e_lam_L, e_mu_L
@@ -446,9 +454,9 @@ def _endgame_split(e_lead: float, e_trail: float, scale: float):
     return p_any * b / (a + b), p_any * a / (a + b)
 
 
-def apply_endgame(margins: dict[int, float], T_seconds: float,
-                  eg: EndgameParams) -> dict[int, float]:
-    """Move one-goal regulation margins per the endgame model."""
+def overlay_endgame(margins: dict[int, float], T_seconds: float,
+                    eg: EndgameParams) -> dict[int, float]:
+    """Legacy overlay: move one-goal regulation margins at the horn."""
     scale = min(max(T_seconds, 0.0), eg.window_seconds) / eg.window_seconds
     if scale == 0:
         return dict(margins)
@@ -470,16 +478,31 @@ def apply_endgame(margins: dict[int, float], T_seconds: float,
 
 def regulation_margin_dist(lam: float, mu: float, t: float, d: int,
                            endgame: EndgameParams | None = None,
+                           pulled: bool = False,
+                           pull_at: tuple[float, float] | None = None,
                            **pp_kwargs) -> dict[int, float]:
-    """FINAL regulation margin distribution (home - away), with optional PP and endgame."""
+    """
+    FINAL regulation margin distribution (home - away), with optional PP
+    (pp_kwargs, as remaining_diff_dist) and endgame. With endgame set this is
+    the pull-time model, endgame_margin_dist (pulled / pull_at as there);
+    without it, plain Skellam, and pulled / pull_at are ignored.
+    """
+    if endgame is not None:
+        return endgame_margin_dist(lam, mu, t, d, endgame, pulled=pulled,
+                                   pull_at=pull_at, **pp_kwargs)
     support, dist = remaining_diff_dist(lam, mu, t, **pp_kwargs)
     out: dict[int, float] = {}
     for m, p in zip(support + d, dist):
         if p > 0:
             out[int(m)] = out.get(int(m), 0.0) + float(p)
-    if endgame is not None:
-        out = apply_endgame(out, max(t, 0.0) * REG_SECONDS, endgame)
     return out
+
+
+def overlay_margin_dist(lam: float, mu: float, t: float, d: int,
+                        eg: EndgameParams, **pp_kwargs) -> dict[int, float]:
+    """Legacy: plain Skellam regulation margins + the overlay (not used for pricing)."""
+    return overlay_endgame(regulation_margin_dist(lam, mu, t, d, **pp_kwargs),
+                           max(t, 0.0) * REG_SECONDS, eg)
 
 
 # ---------------------------------------------------------------------------
@@ -831,10 +854,13 @@ def _outcomes_from_margins(margins: dict[int, float], p_ot: float) -> InGameProb
     return InGameProbs(win, tie, loss, win + tie * p_ot)
 
 
-def in_game_probs_endgame(lam: float, mu: float, t: float, d: int,
+def in_game_probs_overlay(lam: float, mu: float, t: float, d: int,
                           eg: EndgameParams = EndgameParams(),
                           p_ot: float | None = None) -> InGameProbs:
-    """Your formula written out directly (no power play), for transparency."""
+    """
+    Legacy: the original overlay formula written out directly (no power
+    play), for reference; equals overlay_margin_dist. Not used for pricing.
+    """
     if p_ot is None:
         p_ot = lam / (lam + mu)
     base = in_game_probs(lam, mu, t, d, p_ot)
@@ -864,22 +890,24 @@ def in_game_probs_pp(lam: float, mu: float, t: float, d: int,
                      p_ot: float | None = None,
                      dt: float = 1.0,
                      endgame: EndgameParams | None = None,
-                     st_home: float = 1.0, st_away: float = 1.0) -> InGameProbs:
+                     st_home: float = 1.0, st_away: float = 1.0,
+                     pulled: bool = False) -> InGameProbs:
     """
     Win / tie / loss / win-equivalent for the HOME team with a power play in progress.
 
     pp_team    : "home" or "away" (team with the man advantage)
     pp_seconds : seconds left on the penalty
-    penalty    : "minor" (ends on a PP goal) or "major" (runs full length)
+    penalty    : "minor" / "double" / "major" (see PENALTIES)
     pp_mult, sh_mult : scoring-rate multipliers for the PP and SH teams
-    endgame    : optional EndgameParams for the pulled-goalie adjustment
+    endgame    : optional EndgameParams -> pull-time endgame model
     st_home, st_away : per-team special-teams rate multipliers during the PP
+    pulled     : the trailing team's goalie is out now (endgame model only)
     """
     if p_ot is None:
         p_ot = lam / (lam + mu)
     if max(t, 0.0) * REG_SECONDS == 0 or pp_seconds <= 0:
-        return in_game_probs(lam, mu, t, d, p_ot, endgame)
-    margins = regulation_margin_dist(lam, mu, t, d, endgame=endgame,
+        return in_game_probs(lam, mu, t, d, p_ot, endgame, pulled)
+    margins = regulation_margin_dist(lam, mu, t, d, endgame=endgame, pulled=pulled,
                                      pp_team=pp_team, pp_seconds=pp_seconds,
                                      penalty=penalty, pp_mult=pp_mult,
                                      sh_mult=sh_mult, dt=dt,
@@ -899,8 +927,9 @@ def final_margin_dist(lam: float, mu: float, t: float, d: int,
     Distribution of the FINAL home margin, given the current state.
     include_ot=True: a regulation tie becomes +1 (prob p_ot) or -1, which is
     how puck lines settle. include_ot=False: regulation margin only.
-    endgame: optional EndgameParams (pulled-goalie adjustment).
-    pp_kwargs are passed to remaining_diff_dist (pp_team, pp_seconds, penalty, ...).
+    endgame: optional EndgameParams -> pull-time endgame model.
+    pp_kwargs go to regulation_margin_dist (pp_team, pp_seconds, penalty, ...,
+    and pulled / pull_at with the endgame).
     """
     if p_ot is None:
         p_ot = lam / (lam + mu)
@@ -1002,18 +1031,21 @@ def fit_lambdas(p_home_win_equiv: float, total: float,
 
 
 def wp_path(lam: float, mu: float, goals: list[tuple[float, int]],
-            step_s: int = 30, p_ot: float | None = None):
+            step_s: int = 30, p_ot: float | None = None,
+            endgame: EndgameParams | None = None):
     """
     Win-equivalent path over regulation.
     goals: list of (elapsed_seconds, +1 home goal / -1 away goal).
-    Returns arrays (elapsed_seconds, home_win_equiv).
+    endgame: optional EndgameParams (pull-time model, pulls at the assumed
+    times; no power plays). Returns arrays (elapsed_seconds, home_win_equiv).
     """
     times = np.arange(0, REG_SECONDS + 1, step_s)
     goals = sorted(goals)
     out = []
     for s in times:
         d = sum(g for (gs, g) in goals if gs <= s)
-        out.append(in_game_probs(lam, mu, 1 - s / REG_SECONDS, d, p_ot).win_equiv)
+        out.append(in_game_probs(lam, mu, 1 - s / REG_SECONDS, d, p_ot,
+                                 endgame=endgame).win_equiv)
     return times, np.array(out)
 
 
@@ -1075,7 +1107,7 @@ if __name__ == "__main__":
 
     # --- Endgame adjustment ---------------------------------------------
     eg = EndgameParams()
-    print("\nEndgame adjustment (W / T / L / win-equiv):")
+    print("\nEndgame, pull-time model (W / T / L / win-equiv):")
     for label, tt, dd in [("Pre-game", 1.0, 0),
                           ("Home up 1, 10:00 left", t_from_clock(3, 600), 1),
                           ("Home up 1, 2:00 left", t_from_clock(3, 120), 1),
@@ -1120,18 +1152,18 @@ if __name__ == "__main__":
 
     states = [(1.0, 0), (0.5, 1), (t_from_clock(3, 120), 1),
               (t_from_clock(3, 120), -1), (t_from_clock(3, 45), -2)]
+    def _ov(tt, dd, e=eg):
+        return _outcomes_from_margins(overlay_margin_dist(lam, mu, tt, dd, e), 0.5)
     match = all(
-        abs(in_game_probs_endgame(lam, mu, tt, dd, eg).win
-            - in_game_probs(lam, mu, tt, dd, endgame=eg).win) < 1e-9
-        and abs(in_game_probs_endgame(lam, mu, tt, dd, eg).tie
-                - in_game_probs(lam, mu, tt, dd, endgame=eg).tie) < 1e-9
+        abs(in_game_probs_overlay(lam, mu, tt, dd, eg).win - _ov(tt, dd).win) < 1e-9
+        and abs(in_game_probs_overlay(lam, mu, tt, dd, eg).tie - _ov(tt, dd).tie) < 1e-9
         for tt, dd in states)
     adj = in_game_probs(lam, mu, 0.5, 1, endgame=eg)
     zero_eg = EndgameParams(0, 0, 0, 0)
-    print(f"  formula == distribution method:     {match}")
+    print(f"  overlay formula == distribution:    {match}")
     print(f"  endgame W+T+L == 1:                 {abs(adj.win + adj.tie + adj.loss - 1) < 1e-9}")
-    print(f"  zero endgame rates == base:         "
-          f"{abs(in_game_probs(lam, mu, 0.5, 1, endgame=zero_eg).win - base.win) < 1e-9}")
+    print(f"  zero overlay rates == base:         "
+          f"{abs(_ov(0.5, 1, zero_eg).win - base.win) < 1e-9}")
     print(f"  no effect at final horn:            "
           f"{in_game_probs(lam, mu, 0.0, 1, endgame=eg).win == 1.0}")
 
@@ -1234,4 +1266,35 @@ if __name__ == "__main__":
     mg = endgame_margin_dist(lam, mu, 0.025, -1, eg, pulled=True, pp_team="home", pp_seconds=60)
     tot_gap = max(abs(J[hh - aa - 1 == k].sum() - v) for k, v in mg.items())
     print(f"  rates == PP rates reproduces old:   {wiring < 1e-12}")
+
+    # --- endgame= API == live pricer --------------------------------------
+    try:
+        import live_pricer as _lp
+        from live_feed import GameState as _GS
+    except Exception as e:              # pricer deps missing: skip
+        print(f"\n  (live pricer parity skipped: {e})")
+    else:
+        pr = _lp.LivePricer(_lp.PricerConfig(lam, mu, p_ot=0.5, endgame=_lp.m.EndgameParams(),
+                                             spreads=(-1.5, 1.5)))
+        worst = 0.0
+        for el, hs, as_, pp, secs, kind, hp, ap in [
+                (1500, 1, 0, None, 0, "minor", False, False),
+                (2700, 2, 2, "away", 90, "minor", False, False),
+                (3300, 1, 2, "home", 100, "double", False, False),
+                (3510, 1, 2, "home", 60, "minor", True, False),
+                (3540, 3, 2, "home", 45, "minor", False, True)]:
+            st = _GS("x", "H", "A", status="LIVE", period=min(el // 1200 + 1, 3), elapsed=el,
+                     home_score=hs, away_score=as_, pp_team=pp, pp_seconds=secs,
+                     pp_kind=kind, home_goalie_pulled=hp, away_goalie_pulled=ap)
+            got = pr.price(st)
+            kw = dict(pp_team=pp, pp_seconds=secs, penalty=kind) if pp else {}
+            t_, d_, pulled_ = (3600 - el) / REG_SECONDS, hs - as_, hp or ap
+            we_api = (in_game_probs_pp(lam, mu, t_, d_, pp, secs, kind, p_ot=0.5, endgame=eg,
+                                       pulled=pulled_) if pp else
+                      in_game_probs(lam, mu, t_, d_, 0.5, endgame=eg, pulled=pulled_)).win_equiv
+            lines = alt_lines(lam, mu, t_, d_, (-1.5, 1.5), p_ot=0.5, endgame=eg,
+                              pulled=pulled_, **kw)
+            worst = max(worst, abs(we_api - got.home_win),
+                        *(abs(lp_.home_cover - sp["home"]) for lp_, sp in zip(lines, got.spreads)))
+        print(f"  endgame= API == live pricer:        {worst < 1e-12}  ({worst:.1e})")
     print(f"  totals chain margins == margin chain: {tot_gap < 1e-6}")
